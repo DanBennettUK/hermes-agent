@@ -183,7 +183,7 @@ describe('usePromptActions /title', () => {
     expect($sessions.get()[0]?.title).toBe('Fresh chat')
   })
 
-  it('falls through to the slash worker for a bare /title (show current title)', async () => {
+  it('uses the fixed desktop dispatcher for a bare /title (show current title)', async () => {
     const refreshSessions = vi.fn(async () => undefined)
     const requestGateway = vi.fn(async () => ({ output: 'Title: Old title' }) as never)
 
@@ -193,7 +193,8 @@ describe('usePromptActions /title', () => {
     await handle!.submitText('/title')
 
     expect(requestGateway).not.toHaveBeenCalledWith('session.title', expect.anything())
-    expect(requestGateway).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'title' }))
+    expect(requestGateway).toHaveBeenCalledWith('desktop.command', expect.objectContaining({ command: 'title' }))
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
 
   it('surfaces a rename error without touching the sidebar store', async () => {
@@ -221,21 +222,22 @@ describe('usePromptActions /title', () => {
   })
 })
 
-describe('usePromptActions slash.exec dispatch payloads', () => {
+describe('usePromptActions desktop.command dispatch payloads', () => {
   afterEach(() => {
     cleanup()
     $busy.set(false)
+    $connection.set(null)
     vi.restoreAllMocks()
   })
 
-  it('submits /goal send directives returned directly by slash.exec instead of rendering no output', async () => {
+  it('submits /goal send directives returned directly by desktop.command instead of rendering no output', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     const states: Record<string, unknown>[] = []
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
 
-      if (method === 'slash.exec') {
+      if (method === 'desktop.command') {
         return {
           type: 'send',
           notice: '⊙ Goal set. Starting now.',
@@ -258,7 +260,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
 
     await handle!.submitText('/goal write the implementation plan')
 
-    expect(calls.map(c => c.method)).toEqual(['slash.exec', 'prompt.submit'])
+    expect(calls.map(c => c.method)).toEqual(['desktop.command', 'prompt.submit'])
     expect(calls[0]?.params).toEqual({
       command: 'goal write the implementation plan',
       session_id: RUNTIME_SESSION_ID
@@ -289,7 +291,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
 
-      if (method === 'slash.exec') {
+      if (method === 'desktop.command') {
         return { type: 'send', message: 'Write a Python script\nthat prints Hello World' } as never
       }
 
@@ -310,7 +312,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
 
     // The newline lives in the arg — the command still reaches the gateway
     // whole, exactly as the CLI and Telegram handle it.
-    expect(calls.map(c => c.method)).toEqual(['slash.exec', 'prompt.submit'])
+    expect(calls.map(c => c.method)).toEqual(['desktop.command', 'prompt.submit'])
     expect(calls[0]?.params).toEqual({
       command: 'goal Write a Python script\nthat prints Hello World',
       session_id: RUNTIME_SESSION_ID
@@ -327,6 +329,140 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
       .join('\n')
 
     expect(renderedText).not.toContain('empty slash command')
+  })
+
+  it.each([
+    ['local', { authMode: 'token', mode: 'local' }],
+    ['remote token', { authMode: 'token', mode: 'remote' }]
+  ] as const)(
+    'keeps the legacy %s operator fallback when desktop.command is unavailable',
+    async (_label, connection) => {
+      const calls: string[] = []
+      $connection.set(connection as never)
+
+      const requestGateway = vi.fn(async (method: string) => {
+        calls.push(method)
+
+        if (method === 'desktop.command') {
+          throw new Error('unknown method: desktop.command')
+        }
+
+        if (method === 'slash.exec') {
+          return { output: 'Hermes Agent v-test' } as never
+        }
+
+        return {} as never
+      })
+
+      let handle: HarnessHandle | null = null
+      render(
+        <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+      )
+
+      await handle!.submitText('/version')
+
+      expect(calls).toEqual(['desktop.command', 'slash.exec'])
+    }
+  )
+
+  it('uses the OAuth descriptor refreshed during reconnect before deciding legacy fallback', async () => {
+    const calls: string[] = []
+    $connection.set({ authMode: 'token', mode: 'local' } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'desktop.command') {
+        // useGatewayRequest recovered the active secondary before surfacing the
+        // compatibility error. The fallback decision must read this new
+        // descriptor, not the local/token object from before the request.
+        $connection.set({ authMode: 'oauth', mode: 'remote' } as never)
+        throw new Error('unknown method: desktop.command')
+      }
+
+      throw new Error(`unsafe legacy fallback: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/version')
+
+    expect(calls).toEqual(['desktop.command'])
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+  })
+
+  it.each(['tools', 'debug', 'rollback', 'stop'])(
+    'terminally renders a missing desktop.command for /%s over public OAuth without legacy fallback',
+    async command => {
+      const calls: string[] = []
+      const states: Record<string, unknown>[] = []
+      $connection.set({ authMode: 'oauth', mode: 'remote' } as never)
+
+      const requestGateway = vi.fn(async (method: string) => {
+        calls.push(method)
+
+        if (method === 'desktop.command') {
+          throw new Error('unknown method: desktop.command')
+        }
+
+        throw new Error(`unsafe legacy fallback: ${method}`)
+      })
+
+      let handle: HarnessHandle | null = null
+      render(
+        <Harness
+          onReady={h => (handle = h)}
+          onSeedState={state => states.push(state)}
+          refreshSessions={async () => undefined}
+          requestGateway={requestGateway}
+        />
+      )
+
+      await handle!.submitText(`/${command}`)
+
+      expect(calls).toEqual(['desktop.command'])
+      expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+      expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+
+      const renderedText = states
+        .flatMap(state => {
+          const messages = Array.isArray(state.messages)
+            ? (state.messages as Array<{ parts?: Array<{ text?: string }> }>)
+            : []
+
+          return messages.flatMap(message => (message.parts ?? []).map(part => part.text ?? ''))
+        })
+        .join('\n')
+
+      expect(renderedText).toContain('error: unknown method: desktop.command')
+    }
+  )
+
+  it('does not turn a fixed desktop.command usage error into dynamic fallback execution', async () => {
+    const calls: string[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'desktop.command') {
+        throw new Error('usage: /queue <prompt>')
+      }
+
+      throw new Error(`unexpected dynamic fallback: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/queue')
+
+    expect(calls).toEqual(['desktop.command'])
   })
 
   it('restores a degenerate slash payload to the composer instead of losing it', async () => {
@@ -1239,7 +1375,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     expect(ok).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID })
+    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({
       session_id: RECOVERED_SESSION_ID,
       text: 'message during starved loop'

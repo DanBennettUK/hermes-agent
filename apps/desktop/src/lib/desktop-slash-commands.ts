@@ -55,7 +55,7 @@ export type DesktopUnavailableReason = 'advanced' | 'messaging' | 'settings' | '
  * - `action`     → handled by a local client handler (new chat, branch, …)
  * - `picker`     → opens an overlay (`/model`, `/resume`); a typed arg is
  *                  resolved by that picker instead of falling through
- * - `exec`       → runs on the backend via slash.exec / command.dispatch and
+ * - `exec`       → runs through the backend's fixed desktop.command table and
  *                  renders its text output inline
  * - `unavailable`→ a known command with genuinely no desktop UI (terminal-only,
  *                  messaging-only, …); shows a reason instead of executing

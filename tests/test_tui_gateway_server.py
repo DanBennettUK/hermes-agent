@@ -179,6 +179,35 @@ def test_profile_configured_cwd_skips_placeholders_and_missing(tmp_path):
     assert server._profile_configured_cwd(home) is None
 
 
+def test_session_branch_rejects_invalid_parent_profile_home(monkeypatch, tmp_path):
+    """Corrupt server session state must fail closed instead of using launch DB."""
+    outside_profiles = tmp_path / "untrusted" / "work"
+    outside_profiles.mkdir(parents=True)
+    sid = "invalid-profile-parent"
+    server._sessions[sid] = {
+        "agent": object(),
+        "history": [{"role": "user", "content": "hello"}],
+        "history_lock": threading.Lock(),
+        "profile_home": str(outside_profiles),
+        "session_key": "20260713_120000_parent",
+    }
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("invalid profile branch must not fall back to launch DB"),
+    )
+
+    try:
+        response = server._methods["session.branch"]("branch", {"session_id": sid})
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["error"] == {
+        "code": 5008,
+        "message": "parent session profile scope is no longer valid",
+    }
+
+
 def test_completion_cwd_prefers_profile_over_stale_env(monkeypatch, tmp_path):
     """Issue #40334: a new session bound to another profile must use THAT
     profile's terminal.cwd, not the launch profile's stale TERMINAL_CWD."""
@@ -1092,6 +1121,163 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     assert "post-compression reply" in texts
 
 
+def test_public_principal_cannot_access_another_cold_sqlite_session(
+    monkeypatch, tmp_path
+):
+    """Persisted ownership survives loss of the live gateway session record."""
+    from hermes_state import SessionDB
+
+    class PublicTransport:
+        def __init__(self, subject: str):
+            self.authenticated_principal = ("stub", subject)
+            self.authorized_profile = "default"
+            self.allow_profile_override = False
+
+        def write(self, _obj):
+            return True
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    active_transport = [PublicTransport("alice")]
+    monkeypatch.setattr(server, "current_transport", lambda: active_transport[0])
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_completion_cwd", lambda _params=None: str(tmp_path))
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test/model")
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", lambda *_args, **_kwargs: (None, None)
+    )
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    created = server.handle_request(
+        {
+            "id": "create-alice",
+            "method": "session.create",
+            "params": {"source": "desktop"},
+        }
+    )
+    runtime_sid = created["result"]["session_id"]
+    session = server._sessions[runtime_sid]
+    stored_id = session["session_key"]
+    title = "alice-private-session"
+
+    try:
+        # Exercise the real gateway writer, then write a real SQLite transcript.
+        server._ensure_session_db_row(session)
+        db.append_message(stored_id, role="user", content="alice secret")
+        assert db.set_session_title(
+            stored_id, title, authenticated_owner=("stub", "alice")
+        )
+        assert db.get_session(stored_id)["owner_provider"] == "stub"
+        assert db.get_session(stored_id)["owner_principal"] == "alice"
+
+        # Branch rows carry the same durable owner; internal child writers that
+        # omit the transport identity inherit it from the trusted parent row.
+        branch_id = f"{stored_id}-branch"
+        db.create_session(
+            branch_id,
+            source="desktop",
+            parent_session_id=stored_id,
+            model_config={"_branched_from": stored_id},
+        )
+        assert db.session_owned_by(branch_id, ("stub", "alice"))
+        assert not db.session_owned_by(branch_id, ("stub", "bob"))
+        with pytest.raises(PermissionError):
+            db.create_session(
+                f"{stored_id}-bob-branch",
+                source="desktop",
+                parent_session_id=stored_id,
+                authenticated_owner=("stub", "bob"),
+            )
+        legacy_id = f"{stored_id}-legacy"
+        db.create_session(legacy_id, source="tui")
+        with pytest.raises(PermissionError):
+            db.create_session(
+                legacy_id,
+                source="desktop",
+                authenticated_owner=("stub", "alice"),
+            )
+
+        # Simulate a cold process/session: only SQLite remains authoritative.
+        server._sessions.pop(runtime_sid, None)
+        active_transport[0] = PublicTransport("bob")
+
+        listed = server.handle_request(
+            {"id": "list-bob", "method": "session.list", "params": {}}
+        )
+        assert stored_id not in {row["id"] for row in listed["result"]["sessions"]}
+
+        for target in (stored_id, title):
+            denied_resume = server.handle_request(
+                {
+                    "id": f"resume-bob-{target}",
+                    "method": "session.resume",
+                    "params": {"session_id": target},
+                }
+            )
+            assert denied_resume["error"]["code"] == 4033
+
+        denied_delete = server.handle_request(
+            {
+                "id": "delete-bob",
+                "method": "session.delete",
+                "params": {"session_id": stored_id},
+            }
+        )
+        assert denied_delete["error"]["code"] == 4033
+        assert db.get_session(stored_id) is not None
+
+        active_transport[0] = PublicTransport("alice")
+        alice_list = server.handle_request(
+            {"id": "list-alice", "method": "session.list", "params": {}}
+        )
+        assert stored_id in {row["id"] for row in alice_list["result"]["sessions"]}
+        assert legacy_id not in {
+            row["id"] for row in alice_list["result"]["sessions"]
+        }
+        legacy_resume = server.handle_request(
+            {
+                "id": "resume-legacy",
+                "method": "session.resume",
+                "params": {"session_id": legacy_id},
+            }
+        )
+        assert legacy_resume["error"]["code"] == 4033
+
+        resumed = server.handle_request(
+            {
+                "id": "resume-alice",
+                "method": "session.resume",
+                "params": {"session_id": stored_id},
+            }
+        )
+        assert resumed["result"]["messages"] == [
+            {"role": "user", "text": "alice secret"}
+        ]
+
+        resumed_sid = resumed["result"]["session_id"]
+        server._sessions.pop(resumed_sid, None)
+        deleted = server.handle_request(
+            {
+                "id": "delete-alice",
+                "method": "session.delete",
+                "params": {"session_id": stored_id},
+            }
+        )
+        assert deleted["error"] == {
+            "code": 4033,
+            "message": "public authenticated transport is not authorized for RPC method: session.delete",
+        }
+        assert db.get_session(stored_id) is not None
+    finally:
+        server._sessions.pop(runtime_sid, None)
+        for sid, live in list(server._sessions.items()):
+            if live.get("session_key") == stored_id:
+                server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     captured = {}
 
@@ -1195,7 +1381,11 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
         return types.SimpleNamespace(model="test/model")
 
     monkeypatch.setenv("TERMINAL_CWD", str(launch_cwd))
-    monkeypatch.setattr(server, "_profile_home", lambda _profile: profile_home)
+    monkeypatch.setattr(
+        server,
+        "_resolve_session_profile_scope",
+        lambda _profile: ("worker", profile_home),
+    )
     monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: profile_db)
     monkeypatch.setattr(server, "_get_db", lambda: launch_db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
@@ -1761,6 +1951,96 @@ def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
     kwargs = server._background_agent_kwargs(agent, "task-id")
 
     assert kwargs["fallback_model"] == []
+
+
+def test_background_worker_keeps_parent_profile_and_bridge_context_without_leaks(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import profiles
+    from hermes_constants import get_hermes_home, get_hermes_home_override
+    from tools.computer_use import desktop_bridge
+
+    default_home = tmp_path / "default"
+    profiles_root = default_home / "profiles"
+    profile_home = profiles_root / "work"
+    default_home.mkdir()
+    profile_home.mkdir(parents=True)
+    (default_home / "config.yaml").write_text("max_turns: 99\n", encoding="utf-8")
+    (profile_home / "config.yaml").write_text("max_turns: 7\n", encoding="utf-8")
+
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+
+    observed = {}
+    cleanup_done = threading.Event()
+    real_home_reset = server.reset_hermes_home_override
+    real_bridge_reset = desktop_bridge.reset_desktop_bridge_caller
+
+    def tracked_bridge_reset(token):
+        real_bridge_reset(token)
+        observed["bridge_after_reset"] = desktop_bridge._CALLER_PRINCIPAL.get()
+
+    def tracked_home_reset(token):
+        real_home_reset(token)
+        observed["home_after_reset"] = get_hermes_home_override()
+        observed["bridge_when_home_reset"] = desktop_bridge._CALLER_PRINCIPAL.get()
+        cleanup_done.set()
+
+    monkeypatch.setattr(desktop_bridge, "reset_desktop_bridge_caller", tracked_bridge_reset)
+    monkeypatch.setattr(server, "reset_hermes_home_override", tracked_home_reset)
+
+    class BackgroundAgent:
+        def __init__(self, **kwargs):
+            observed["home"] = get_hermes_home()
+            observed["max_iterations"] = kwargs["max_iterations"]
+            observed["scope"] = desktop_bridge.current_desktop_bridge_scope()
+
+        def run_conversation(self, **_kwargs):
+            raise RuntimeError("background exploded")
+
+    monkeypatch.setattr("run_agent.AIAgent", BackgroundAgent)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    sid = "background-profile"
+    parent_agent = types.SimpleNamespace(
+        _fallback_chain=[],
+        _session_db=object(),
+        api_mode="chat_completions",
+        base_url="https://example.invalid",
+        enabled_toolsets=["file"],
+        model="test/model",
+        provider="test",
+        reasoning_config={"enabled": False},
+        service_tier="auto",
+    )
+    server._sessions[sid] = {
+        "agent": parent_agent,
+        "authenticated_principal": ("stub", "alice"),
+        "cwd": str(tmp_path),
+        "profile": "work",
+        "profile_home": str(profile_home),
+        "running": False,
+        "session_key": "20260713_010101_background",
+        "source": "desktop",
+    }
+
+    try:
+        response = server._methods["prompt.background"](
+            "background",
+            {"session_id": sid, "text": "keep my profile"},
+        )
+        assert "error" not in response
+        assert cleanup_done.wait(2), "background context cleanup did not finish"
+        assert observed["home"] == profile_home
+        assert observed["max_iterations"] == 7
+        assert observed["scope"] == desktop_bridge.DesktopBridgeScope(
+            "stub", "alice", "work"
+        )
+        assert observed["bridge_after_reset"] is None
+        assert observed["home_after_reset"] is None
+        assert observed["bridge_when_home_reset"] is None
+    finally:
+        server._sessions.pop(sid, None)
 
 
 def test_startup_runtime_resolves_short_alias_without_network(monkeypatch):
@@ -6186,6 +6466,7 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
 
     mock_title.assert_called_once()
     args = mock_title.call_args.args
+    assert isinstance(args[0], server._LiveSessionTitleDB)
     assert args[1] == "session-key"
     assert args[2] == "Tell me about Rome"
     assert args[3] == "Rome was founded in 753 BC."
@@ -7877,6 +8158,182 @@ def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, t
     assert payload["session_start"] == "2026-01-01T12:00:00"
     assert payload["system_prompt"] == "You are Hermes."
     assert payload["messages"] == history
+
+
+def test_session_save_remote_profile_isolated_from_launch_home(monkeypatch, tmp_path):
+    """App-global remote sessions export only into their owning profile."""
+    from hermes_cli import profiles as profiles_mod
+
+    launch_home = tmp_path / ".hermes"
+    profile_home = launch_home / "profiles" / "work"
+    launch_home.mkdir()
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(profiles_mod, "_get_default_hermes_home", lambda: launch_home)
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+
+    sid = "remote-save-sid"
+    agent = types.SimpleNamespace(
+        model="remote-model",
+        session_id="20260713_120000_remote",
+        session_start=datetime(2026, 7, 13, 12, 0, 0),
+        _cached_system_prompt="Remote profile prompt.",
+    )
+    server._sessions[sid] = {
+        "agent": agent,
+        "session_key": agent.session_id,
+        "history": [{"role": "user", "content": "profile private"}],
+        "history_lock": threading.Lock(),
+        "created_at": 1783944000.0,
+        "profile": "work",
+        "profile_home": str(profile_home),
+    }
+    try:
+        resp = server._methods["session.save"]("remote-save", {"session_id": sid})
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert "error" not in resp, resp
+    saved_file = Path(resp["result"]["file"])
+    assert saved_file.parent == profile_home / "sessions" / "saved"
+    assert saved_file.exists()
+    assert not (launch_home / "sessions" / "saved").exists()
+    assert json.loads(saved_file.read_text(encoding="utf-8"))["messages"] == [
+        {"role": "user", "content": "profile private"}
+    ]
+
+
+def test_live_remote_profile_metadata_and_generated_title_never_touch_launch_db(
+    monkeypatch, tmp_path
+):
+    """Live reads and post-turn title writes stay in the session profile DB."""
+    from hermes_state import SessionDB
+
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "work"
+    launch_home.mkdir()
+    profile_home.mkdir(parents=True)
+    launch_db = SessionDB(db_path=launch_home / "state.db")
+    profile_db = SessionDB(db_path=profile_home / "state.db")
+    owner = ("stub", "alice")
+    session_key = "20260713_150000_remote_meta"
+
+    for db, title, message in (
+        (launch_db, "Launch private title", "launch private history"),
+        (profile_db, "Remote profile title", "remote profile history"),
+    ):
+        db.create_session(
+            session_key,
+            source="desktop",
+            authenticated_owner=owner,
+        )
+        db.append_message(session_key, role="user", content=message)
+        assert db.set_session_title(
+            session_key, title, authenticated_owner=owner
+        )
+
+    class _Agent:
+        model = "remote-model"
+        provider = "remote-provider"
+        session_total_tokens = 7
+        session_id = session_key
+        _session_db = profile_db
+
+    class _ImmediateThread:
+        def __init__(self, target=None, args=(), kwargs=None, **_thread_kwargs):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            self._target(*self._args, **self._kwargs)
+
+        def is_alive(self):
+            return False
+
+    sid = "remote-meta-live"
+    server._sessions[sid] = _session(
+        agent=_Agent(),
+        authenticated_principal=owner,
+        history=[{"role": "user", "content": "in-memory fallback"}],
+        profile="work",
+        profile_home=str(profile_home),
+        session_key=session_key,
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: launch_db)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        "agent.title_generator.generate_title",
+        lambda *_args, **_kwargs: "Generated remote title",
+    )
+
+    try:
+        active = server.handle_request(
+            {"id": "active", "method": "session.active_list", "params": {}}
+        )
+        title = server.handle_request(
+            {
+                "id": "title",
+                "method": "session.title",
+                "params": {"session_id": sid},
+            }
+        )
+        status = server.handle_request(
+            {
+                "id": "status",
+                "method": "session.status",
+                "params": {"session_id": sid},
+            }
+        )
+        history = server.handle_request(
+            {
+                "id": "history",
+                "method": "session.history",
+                "params": {"session_id": sid},
+            }
+        )
+
+        active_rows = {row["id"]: row for row in active["result"]["sessions"]}
+        assert active_rows[sid]["title"] == "Remote profile title"
+        assert title["result"]["title"] == "Remote profile title"
+        assert "Title: Remote profile title" in status["result"]["output"]
+        assert str(profile_home) in status["result"]["output"]
+        assert [row["text"] for row in history["result"]["messages"]] == [
+            "remote profile history"
+        ]
+
+        # Make this conversation eligible for auto-title. The launch row keeps
+        # its title as a canary for the old process-global DB leak.
+        profile_db._conn.execute(
+            "UPDATE sessions SET title = NULL WHERE id = ?", (session_key,)
+        )
+        profile_db._conn.commit()
+        from agent.title_generator import maybe_auto_title
+
+        maybe_auto_title(
+            server._LiveSessionTitleDB(server._sessions[sid]),
+            session_key,
+            "Generate a remote title",
+            "A remote-only answer.",
+            [
+                {"role": "user", "content": "Generate a remote title"},
+                {"role": "assistant", "content": "A remote-only answer."},
+            ],
+        )
+
+        assert profile_db.get_session_title(
+            session_key, authenticated_owner=owner
+        ) == "Generated remote title"
+        assert launch_db.get_session_title(
+            session_key, authenticated_owner=owner
+        ) == "Launch private title"
+        assert [
+            row["content"]
+            for row in launch_db.get_messages(session_key)
+        ] == ["launch private history"]
+    finally:
+        server._sessions.pop(sid, None)
+        profile_db.close()
+        launch_db.close()
 
 
 def test_notification_event_dedup_key_preserves_distinct_watch_matches():

@@ -701,6 +701,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     user_id TEXT,
+    owner_provider TEXT,
+    owner_principal TEXT,
     session_key TEXT,
     chat_id TEXT,
     chat_type TEXT,
@@ -808,6 +810,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_authenticated_owner
+    ON sessions(owner_provider, owner_principal, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 """
@@ -1609,6 +1613,7 @@ class SessionDB:
         thread_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
+        authenticated_owner: Tuple[str, str] = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -1627,14 +1632,70 @@ class SessionDB:
         a persisted, now-inactive row belongs to the caller's chat/thread before
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
+        ``authenticated_owner`` is the canonical provider/principal identity
+        established by an authenticated transport. It is immutable once the row
+        exists: an authenticated insert may not claim a legacy unowned row or a
+        row owned by someone else. Children inherit their parent's owner so
+        compression continuations and delegate/branch rows stay in the same
+        authorization domain even when their internal writer has no transport.
+        Local/internal callers omit this argument and retain the historical
+        unrestricted behavior.
         """
+        owner = None
+        if authenticated_owner is not None:
+            if not isinstance(authenticated_owner, (tuple, list)) or len(authenticated_owner) != 2:
+                raise ValueError("authenticated_owner must be a provider/principal pair")
+            provider, principal = (str(part).strip() for part in authenticated_owner)
+            if not provider or not principal:
+                raise ValueError("authenticated_owner must contain non-empty values")
+            owner = (provider, principal)
+
         def _do(conn):
+            effective_owner = owner
+            if parent_session_id:
+                parent = conn.execute(
+                    "SELECT owner_provider, owner_principal FROM sessions WHERE id = ?",
+                    (parent_session_id,),
+                ).fetchone()
+                if parent is not None:
+                    parent_owner = (
+                        str(parent["owner_provider"] or "").strip(),
+                        str(parent["owner_principal"] or "").strip(),
+                    )
+                    if any(parent_owner) and not all(parent_owner):
+                        raise PermissionError("parent session has invalid persisted ownership")
+                    if all(parent_owner):
+                        if effective_owner is not None and effective_owner != parent_owner:
+                            raise PermissionError(
+                                "child session owner does not match parent session owner"
+                            )
+                        effective_owner = parent_owner
+                    elif effective_owner is not None:
+                        # Public/authenticated children may not attach themselves
+                        # to a legacy unowned parent and thereby bless that lineage.
+                        raise PermissionError("parent session has no persisted owner")
+
+            existing = conn.execute(
+                "SELECT owner_provider, owner_principal FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if existing is not None and effective_owner is not None:
+                existing_owner = (
+                    str(existing["owner_provider"] or "").strip(),
+                    str(existing["owner_principal"] or "").strip(),
+                )
+                if existing_owner != effective_owner:
+                    raise PermissionError(
+                        "session is unowned or belongs to a different authenticated principal"
+                    )
+
             conn.execute(
                 """INSERT INTO sessions (
-                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   id, source, user_id, owner_provider, owner_principal,
+                   session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, parent_session_id, cwd, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -1649,6 +1710,8 @@ class SessionDB:
                     session_id,
                     source,
                     user_id,
+                    effective_owner[0] if effective_owner else None,
+                    effective_owner[1] if effective_owner else None,
                     session_key,
                     chat_id,
                     chat_type,
@@ -1667,6 +1730,38 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def session_owned_by(
+        self, session_id: str, authenticated_owner: Tuple[str, str]
+    ) -> bool:
+        """Return whether a persisted row has exactly ``authenticated_owner``.
+
+        Unowned legacy rows deliberately return ``False``. This method is the
+        database-level authorization primitive used by public transports before
+        any title, transcript, or mutable session state is resolved.
+        """
+        if not isinstance(authenticated_owner, (tuple, list)) or len(authenticated_owner) != 2:
+            return False
+        provider, principal = (str(part).strip() for part in authenticated_owner)
+        if not provider or not principal or not session_id:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM sessions "
+                "WHERE id = ? AND owner_provider = ? AND owner_principal = ? LIMIT 1",
+                (session_id, provider, principal),
+            ).fetchone()
+        return row is not None
+
+    def session_exists(self, session_id: str) -> bool:
+        """Return whether a row exists without resolving any session metadata."""
+        if not session_id:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+        return row is not None
 
     def record_gateway_session_peer(
         self,
@@ -2028,13 +2123,29 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def reopen_session(self, session_id: str) -> None:
+    def reopen_session(
+        self,
+        session_id: str,
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                (session_id,),
-            )
+            if authenticated_owner is None:
+                cursor = conn.execute(
+                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                    (session_id,),
+                )
+            else:
+                provider, principal = authenticated_owner
+                cursor = conn.execute(
+                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                    "WHERE id = ? AND owner_provider = ? AND owner_principal = ?",
+                    (session_id, provider, principal),
+                )
+                if cursor.rowcount == 0:
+                    raise PermissionError(
+                        "session is unowned or belongs to a different authenticated principal"
+                    )
         self._execute_write(_do)
 
     def update_session_cwd(
@@ -2075,7 +2186,11 @@ class SessionDB:
 
         self._execute_write(_do)
 
-    def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
+    def backfill_repo_roots(
+        self,
+        cwd_to_root: Dict[str, str],
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> None:
         """Persist resolved git repo roots for cwds that don't have one yet.
 
         Backfills history so projects light up for sessions created before the
@@ -2088,10 +2203,18 @@ class SessionDB:
 
         def _do(conn):
             for root, cwd in pairs:
+                owner_clause = ""
+                params: tuple = (root, cwd)
+                if authenticated_owner is not None:
+                    owner_clause = (
+                        " AND owner_provider = ? AND owner_principal = ?"
+                    )
+                    params = (*params, *authenticated_owner)
                 conn.execute(
                     "UPDATE sessions SET git_repo_root = ? "
-                    "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''",
-                    (root, cwd),
+                    "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''"
+                    f"{owner_clause}",
+                    params,
                 )
 
         self._execute_write(_do)
@@ -2583,11 +2706,20 @@ class SessionDB:
 
         return self._execute_write(_do) or 0
 
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_session(
+        self,
+        session_id: str,
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
+        owner_clause = ""
+        params: tuple = (session_id,)
+        if authenticated_owner is not None:
+            owner_clause = " AND owner_provider = ? AND owner_principal = ?"
+            params = (session_id, *authenticated_owner)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                f"SELECT * FROM sessions WHERE id = ?{owner_clause}", params
             )
             row = cursor.fetchone()
         return dict(row) if row else None
@@ -2703,7 +2835,12 @@ class SessionDB:
         ).fetchone()
         return row is not None
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> bool:
         """Set or update a session's title.
 
         Returns True if session was found and title was set.
@@ -2716,12 +2853,23 @@ class SessionDB:
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                    "SELECT id, owner_provider, owner_principal FROM sessions "
+                    "WHERE title = ? AND id != ?",
                     (title, session_id),
                 )
                 conflict = cursor.fetchone()
                 if conflict:
                     conflict_id = conflict["id"]
+                    conflict_owner = (
+                        str(conflict["owner_provider"] or "").strip(),
+                        str(conflict["owner_principal"] or "").strip(),
+                    )
+                    if (
+                        authenticated_owner is not None
+                        and conflict_owner != tuple(authenticated_owner)
+                    ):
+                        # Keep another principal's session id/lineage opaque.
+                        raise ValueError(f"Title '{title}' is already in use")
                     # A compression continuation is the live, projected-forward
                     # head of its conversation; its compressed predecessors are
                     # ended and hidden from the session list (list_sessions_rich
@@ -2744,19 +2892,35 @@ class SessionDB:
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
                         )
-            cursor = conn.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?",
-                (title, session_id),
-            )
+            if authenticated_owner is None:
+                cursor = conn.execute(
+                    "UPDATE sessions SET title = ? WHERE id = ?",
+                    (title, session_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE sessions SET title = ? "
+                    "WHERE id = ? AND owner_provider = ? AND owner_principal = ?",
+                    (title, session_id, *authenticated_owner),
+                )
             return cursor.rowcount
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_title(self, session_id: str) -> Optional[str]:
+    def get_session_title(
+        self,
+        session_id: str,
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> Optional[str]:
         """Get the title for a session, or None."""
+        owner_clause = ""
+        params: tuple = (session_id,)
+        if authenticated_owner is not None:
+            owner_clause = " AND owner_provider = ? AND owner_principal = ?"
+            params = (session_id, *authenticated_owner)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT title FROM sessions WHERE id = ?", (session_id,)
+                f"SELECT title FROM sessions WHERE id = ?{owner_clause}", params
             )
             row = cursor.fetchone()
         return row["title"] if row else None
@@ -2811,11 +2975,20 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+    def get_session_by_title(
+        self,
+        title: str,
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
+        owner_clause = ""
+        params: tuple = (title,)
+        if authenticated_owner is not None:
+            owner_clause = " AND owner_provider = ? AND owner_principal = ?"
+            params = (title, *authenticated_owner)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
+                f"SELECT * FROM sessions WHERE title = ?{owner_clause}", params
             )
             row = cursor.fetchone()
         return dict(row) if row else None
@@ -2849,7 +3022,11 @@ class SessionDB:
             return exact["id"]
         return None
 
-    def get_next_title_in_lineage(self, base_title: str) -> str:
+    def get_next_title_in_lineage(
+        self,
+        base_title: str,
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").
 
         Strips any existing " #N" suffix to find the base name, then finds
@@ -2865,10 +3042,16 @@ class SessionDB:
         # Find all existing numbered variants
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
         escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        owner_clause = ""
+        params: tuple = (base, f"{escaped} #%")
+        if authenticated_owner is not None:
+            owner_clause = " AND owner_provider = ? AND owner_principal = ?"
+            params = (*params, *authenticated_owner)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
-                (base, f"{escaped} #%"),
+                "SELECT title FROM sessions WHERE (title = ? OR title LIKE ? ESCAPE '\\')"
+                f"{owner_clause}",
+                params,
             )
             existing = [row["title"] for row in cursor.fetchall()]
 
@@ -2969,7 +3152,11 @@ class SessionDB:
             )
         return cls._session_compact_cols_sql
 
-    def distinct_session_cwds(self, include_archived: bool = False) -> List[Dict[str, Any]]:
+    def distinct_session_cwds(
+        self,
+        include_archived: bool = False,
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> List[Dict[str, Any]]:
         """Distinct non-empty session cwds with usage stats, for repo discovery.
 
         Aggregates across ALL session history (not a single page), so the desktop
@@ -2978,13 +3165,18 @@ class SessionDB:
         count: a worktree session is still a real workspace signal.
         """
         where = "cwd IS NOT NULL AND TRIM(cwd) != ''"
+        params: tuple = ()
         if not include_archived:
             where += " AND archived = 0"
+        if authenticated_owner is not None:
+            where += " AND owner_provider = ? AND owner_principal = ?"
+            params = tuple(authenticated_owner)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT cwd AS cwd, COUNT(*) AS sessions, "
                 "MAX(COALESCE(ended_at, started_at, 0)) AS last_active "
-                f"FROM sessions WHERE {where} GROUP BY cwd"
+                f"FROM sessions WHERE {where} GROUP BY cwd",
+                params,
             ).fetchall()
         return [
             {
@@ -3011,6 +3203,7 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        authenticated_owner: Tuple[str, str] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3090,6 +3283,11 @@ class SessionDB:
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        if authenticated_owner is not None:
+            where_clauses.append(
+                "s.owner_provider = ? AND s.owner_principal = ?"
+            )
+            params.extend(authenticated_owner)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -3267,7 +3465,11 @@ class SessionDB:
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue
-                tip_row = self._get_session_rich_row(tip_id, compact_rows=compact_rows)
+                tip_row = self._get_session_rich_row(
+                    tip_id,
+                    compact_rows=compact_rows,
+                    authenticated_owner=authenticated_owner,
+                )
                 if not tip_row:
                     projected.append(s)
                     continue
@@ -3353,7 +3555,12 @@ class SessionDB:
             runs.append(s)
         return runs
 
-    def _get_session_rich_row(self, session_id: str, compact_rows: bool = False) -> Optional[Dict[str, Any]]:
+    def _get_session_rich_row(
+        self,
+        session_id: str,
+        compact_rows: bool = False,
+        authenticated_owner: Tuple[str, str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Fetch a single session with the same enriched columns as
         ``list_sessions_rich`` (preview + last_active). Returns None if the
         session doesn't exist.
@@ -3362,6 +3569,11 @@ class SessionDB:
         ``list_sessions_rich`` for details).
         """
         _sel = self._compact_session_cols() if compact_rows else "s.*"
+        owner_clause = ""
+        params: tuple = (session_id,)
+        if authenticated_owner is not None:
+            owner_clause = " AND s.owner_provider = ? AND s.owner_principal = ?"
+            params = (session_id, *authenticated_owner)
         query = f"""
             SELECT {_sel},
                 COALESCE(
@@ -3376,10 +3588,10 @@ class SessionDB:
                     s.started_at
                 ) AS last_active
             FROM sessions s
-            WHERE s.id = ?
+            WHERE s.id = ?{owner_clause}
         """
         with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
+            cursor = self._conn.execute(query, params)
             row = cursor.fetchone()
         if not row:
             return None
@@ -4086,6 +4298,7 @@ class SessionDB:
         session_id: str,
         include_ancestors: bool = False,
         include_inactive: bool = False,
+        authenticated_owner: Tuple[str, str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -4098,6 +4311,13 @@ class SessionDB:
         session_ids = [session_id]
         if include_ancestors:
             session_ids = self._session_lineage_root_to_tip(session_id)
+        if authenticated_owner is not None:
+            for owned_session_id in session_ids:
+                if not self.session_owned_by(owned_session_id, authenticated_owner):
+                    raise PermissionError(
+                        "session lineage is unowned or belongs to a different "
+                        "authenticated principal"
+                    )
 
         active_clause = "" if include_inactive else " AND active = 1"
         with self._lock:
@@ -5149,6 +5369,7 @@ class SessionDB:
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        authenticated_owner: Tuple[str, str] = None,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -5163,10 +5384,20 @@ class SessionDB:
         removed_delegate_ids: List[str] = []
 
         def _do(conn):
+            owner_clause = ""
+            params: tuple = (session_id,)
+            if authenticated_owner is not None:
+                owner_clause = " AND owner_provider = ? AND owner_principal = ?"
+                params = (session_id, *authenticated_owner)
             cursor = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+                f"SELECT COUNT(*) FROM sessions WHERE id = ?{owner_clause}", params
             )
             if cursor.fetchone()[0] == 0:
+                if authenticated_owner is not None:
+                    raise PermissionError(
+                        "session is unowned or belongs to a different "
+                        "authenticated principal"
+                    )
                 return False
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.

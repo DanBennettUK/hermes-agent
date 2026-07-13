@@ -53,6 +53,12 @@ import {
   resolveTestWsUrl,
   tokenPreview
 } from './connection-config'
+import {
+  detachBridgeOwnedPoolEntry,
+  releaseBridgeOwnerAndStopSidecarIfIdle,
+  scheduleBridgeReconnectIfCurrent,
+  ScopedComputerUseBridgeLifecycle
+} from './computer-use-bridge-lifecycle'
 import { adoptServedDashboardToken } from './dashboard-token'
 import {
   buildPosixCleanupScript,
@@ -66,6 +72,12 @@ import {
 import { installEmbedReferer } from './embed-referer'
 import { readDirForIpc } from './fs-read-dir'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
+import {
+  abortAndWaitForPrimaryStartup,
+  PrimaryStartupCancelledError,
+  PrimaryStartupLifecycle,
+  removeBootstrapMarkerAfterTeardown
+} from './primary-startup-lifecycle'
 import { scanGitRepos } from './git-repo-scan'
 import {
   fileDiffVsHead,
@@ -802,6 +814,8 @@ function registerMediaProtocol() {
 let mainWindow = null
 let hermesProcess = null
 let connectionPromise = null
+const primaryStartupLifecycle = new PrimaryStartupLifecycle()
+let primaryTeardownPromise: Promise<void> | null = null
 // Additional per-profile backends, keyed by profile name. The PRIMARY backend
 // (the desktop's launch profile) stays managed by hermesProcess +
 // connectionPromise + startHermes(); this pool only holds EXTRA profile
@@ -844,8 +858,14 @@ let connectionConfigCacheMtime = null
 let computerUseBridgeProcess = null
 let computerUseBridgeStartPromise = null
 let computerUseBridgeState: any = null
-let computerUseBridgeReconnectTimer = null
+const computerUseBridgeLifecycle = new ScopedComputerUseBridgeLifecycle<any>()
+const computerUseBridgeConnections = computerUseBridgeLifecycle.connections
+const computerUseBridgeConnectionPromises = computerUseBridgeLifecycle.connectionPromises
+const computerUseBridgeReconnectTimers = computerUseBridgeLifecycle.reconnectTimers
 let computerUseBridgeStopping = false
+let computerUseBridgeGeneration = 0
+let primaryComputerUseBridgeRemoteKey = null
+const PRIMARY_COMPUTER_USE_BRIDGE_OWNER = 'primary'
 const COMPUTER_USE_BRIDGE_TOKEN_ENV = 'HERMES_DESKTOP_COMPUTER_USE_BRIDGE_TOKEN'
 const COMPUTER_USE_BRIDGE_RECONNECT_MS = 3_000
 const COMPUTER_USE_BRIDGE_START_TIMEOUT_MS = 12_000
@@ -3519,7 +3539,7 @@ function resolveHermesBackend(backendArgs) {
   }
 }
 
-async function ensureRuntime(backend) {
+async function ensureRuntime(backend, primaryStartupGeneration: number | null = null) {
   if (!backend.bootstrap) {
     await advanceBootProgress('runtime.external', `Using ${backend.label}`, 32)
 
@@ -3565,15 +3585,20 @@ async function ensureRuntime(backend) {
       void 0
     }
 
-    bootstrapAbortController = new AbortController()
+    if (primaryStartupGeneration !== null) {
+      primaryStartupLifecycle.assertCurrent(primaryStartupGeneration)
+    }
 
-    const bootstrapResult = await runBootstrap({
+    const ownedBootstrapAbortController = new AbortController()
+    bootstrapAbortController = ownedBootstrapAbortController
+
+    const ownedBootstrapPromise = runBootstrap({
       installStamp: backend.installStamp,
       activeRoot: backend.activeRoot,
       sourceRepoRoot: SOURCE_REPO_ROOT,
       hermesHome: HERMES_HOME,
       logRoot: path.join(HERMES_HOME, 'logs'),
-      abortSignal: bootstrapAbortController.signal,
+      abortSignal: ownedBootstrapAbortController.signal,
       onEvent: ev => {
         // Tee every bootstrap event to (a) the desktop log for forensics
         // and (b) the renderer for live progress UI. Either may be absent;
@@ -3594,7 +3619,30 @@ async function ensureRuntime(backend) {
       writeMarker: writeBootstrapMarker
     })
 
-    bootstrapAbortController = null
+    if (primaryStartupGeneration !== null) {
+      primaryStartupLifecycle.captureBootstrap(
+        primaryStartupGeneration,
+        ownedBootstrapAbortController,
+        ownedBootstrapPromise
+      )
+    }
+
+    let bootstrapResult
+
+    try {
+      bootstrapResult = await ownedBootstrapPromise
+    } finally {
+      if (bootstrapAbortController === ownedBootstrapAbortController) {
+        bootstrapAbortController = null
+      }
+      if (primaryStartupGeneration !== null) {
+        primaryStartupLifecycle.clearBootstrap(
+          primaryStartupGeneration,
+          ownedBootstrapAbortController,
+          ownedBootstrapPromise
+        )
+      }
+    }
 
     if (bootstrapResult.cancelled) {
       const cancelledError = new Error('Hermes install was cancelled.') as any
@@ -3624,7 +3672,7 @@ async function ensureRuntime(backend) {
 
     // Re-resolve now that the install exists. The new resolution lands in
     // step 3 (bootstrap-complete marker) and we recurse to wire venvPython.
-    return ensureRuntime(resolveHermesBackend(backend.args))
+    return ensureRuntime(resolveHermesBackend(backend.args), primaryStartupGeneration)
   }
 
   // bootstrap=true with a real backend (createActiveBackend path) means we
@@ -3812,29 +3860,41 @@ function fetchComputerUseBridgeJson(baseUrl, token, pathSuffix, options: any = {
   })
 }
 
-function closeComputerUseBridgeSocket() {
-  const ws = computerUseBridgeState?.ws
-  computerUseBridgeState = computerUseBridgeState ? { ...computerUseBridgeState, ws: null, remoteKey: null } : null
-  if (ws) {
-    try {
-      ws.close()
-    } catch {
-      void 0
-    }
+function closeComputerUseBridgeSocket(remoteKey = null, allowReconnect = false) {
+  computerUseBridgeLifecycle.closeSockets(remoteKey, allowReconnect)
+}
+
+function stopRemoteComputerUseBridge(remoteKey, owner) {
+  if (remoteKey && owner) {
+    releaseBridgeOwnerAndStopSidecarIfIdle({
+      lifecycle: computerUseBridgeLifecycle,
+      remoteKey,
+      owner,
+      stopSidecar: stopLocalComputerUseBridgeSidecar
+    })
   }
 }
 
-function stopComputerUseBridge() {
+function stopPrimaryComputerUseBridge() {
+  const remoteKey = primaryComputerUseBridgeRemoteKey
+  primaryComputerUseBridgeRemoteKey = null
+  stopRemoteComputerUseBridge(remoteKey, PRIMARY_COMPUTER_USE_BRIDGE_OWNER)
+}
+
+function stopLocalComputerUseBridgeSidecar() {
   computerUseBridgeStopping = true
-  if (computerUseBridgeReconnectTimer) {
-    clearTimeout(computerUseBridgeReconnectTimer)
-    computerUseBridgeReconnectTimer = null
-  }
-  closeComputerUseBridgeSocket()
-  stopBackendChild(computerUseBridgeProcess)
+  computerUseBridgeGeneration += 1
+  const child = computerUseBridgeProcess
   computerUseBridgeProcess = null
   computerUseBridgeStartPromise = null
   computerUseBridgeState = null
+  stopBackendChild(child)
+}
+
+function stopComputerUseBridge() {
+  primaryComputerUseBridgeRemoteKey = null
+  computerUseBridgeLifecycle.cancelAll()
+  stopLocalComputerUseBridgeSidecar()
 }
 
 function bridgeUrlFromStdout(line) {
@@ -3843,28 +3903,48 @@ function bridgeUrlFromStdout(line) {
 }
 
 async function ensureLocalComputerUseBridgeSidecar() {
-  if (computerUseBridgeState?.url && computerUseBridgeState?.token && computerUseBridgeProcess && !computerUseBridgeProcess.killed) {
-    return { url: computerUseBridgeState.url, token: computerUseBridgeState.token }
+  if (
+    computerUseBridgeState?.url &&
+    computerUseBridgeState?.token &&
+    computerUseBridgeProcess &&
+    !computerUseBridgeProcess.killed
+  ) {
+    return {
+      child: computerUseBridgeProcess,
+      url: computerUseBridgeState.url,
+      token: computerUseBridgeState.token
+    }
   }
 
   if (computerUseBridgeStartPromise) {
     return computerUseBridgeStartPromise
   }
 
-  computerUseBridgeStartPromise = (async () => {
+  const generation = computerUseBridgeGeneration
+  const startPromise = (async () => {
     const token = crypto.randomBytes(32).toString('base64url')
-    const bridgeArgs = ['computer-use', 'bridge', '--host', '127.0.0.1', '--port', '0', '--token-env', COMPUTER_USE_BRIDGE_TOKEN_ENV]
+    const bridgeArgs = [
+      'computer-use',
+      'bridge',
+      '--host',
+      '127.0.0.1',
+      '--port',
+      '0',
+      '--token-env',
+      COMPUTER_USE_BRIDGE_TOKEN_ENV
+    ]
     let backend
 
-    try {
-      backend = resolveHermesBackend(bridgeArgs)
-      if (backend.bootstrap) {
-        throw new Error('Local Hermes runtime is not installed; cannot start Computer Use bridge sidecar.')
-      }
-      backend = await ensureRuntime(backend)
-    } catch (error) {
-      computerUseBridgeStartPromise = null
-      throw error
+    backend = resolveHermesBackend(bridgeArgs)
+    if (backend.bootstrap) {
+      throw new Error('Local Hermes runtime is not installed; cannot start Computer Use bridge sidecar.')
+    }
+    backend = await ensureRuntime(backend)
+
+    // A final owner release may happen while runtime resolution is in flight.
+    // Do not spawn a sidecar for that stale generation after teardown cleared it.
+    if (computerUseBridgeStopping || generation !== computerUseBridgeGeneration) {
+      throw new Error('Local Computer Use bridge startup was cancelled.')
     }
 
     return new Promise((resolve, reject) => {
@@ -3896,7 +3976,6 @@ async function ensureLocalComputerUseBridgeSidecar() {
         }
         settled = true
         clearTimeout(timer)
-        computerUseBridgeStartPromise = null
         if (error) {
           stopBackendChild(child)
           reject(error)
@@ -3913,10 +3992,14 @@ async function ensureLocalComputerUseBridgeSidecar() {
         const text = String(chunk || '')
         stdoutBuffer += text
         rememberLog(`[computer-use-bridge] ${text}`)
+        if (computerUseBridgeStopping || generation !== computerUseBridgeGeneration) {
+          finish(new Error('Local Computer Use bridge startup was cancelled.'))
+          return
+        }
         const url = bridgeUrlFromStdout(stdoutBuffer)
         if (url) {
           computerUseBridgeState = { ...(computerUseBridgeState || {}), child, token, url }
-          finish(null, { url, token })
+          finish(null, { child, url, token })
         }
       })
       child.stderr.on('data', chunk => rememberLog(`[computer-use-bridge] ${String(chunk || '')}`))
@@ -3930,22 +4013,38 @@ async function ensureLocalComputerUseBridgeSidecar() {
           finish(new Error(`Local Computer Use bridge exited before ready (${signal || code}).`))
         }
         if (computerUseBridgeState?.child === child) {
-          closeComputerUseBridgeSocket()
+          // A sidecar crash is recoverable: closing the remote sockets causes
+          // each scoped connector's normal reconnect path to restart the one
+          // shared sidecar and re-register its own profile.
+          closeComputerUseBridgeSocket(null, true)
           computerUseBridgeState = null
         }
       })
     })
   })()
 
-  return computerUseBridgeStartPromise
+  computerUseBridgeStartPromise = startPromise
+  void startPromise.then(
+    () => {
+      if (computerUseBridgeStartPromise === startPromise) {
+        computerUseBridgeStartPromise = null
+      }
+    },
+    () => {
+      if (computerUseBridgeStartPromise === startPromise) {
+        computerUseBridgeStartPromise = null
+      }
+    }
+  )
+  return startPromise
 }
 
-async function buildRemoteComputerUseBridgeWsUrl(remote) {
+async function buildRemoteComputerUseBridgeWsUrl(remote, profile) {
   if (remote.authMode === 'oauth') {
     const ticket = await mintGatewayWsTicket(remote.baseUrl)
-    return buildComputerUseBridgeWsUrlWithTicket(remote.baseUrl, ticket)
+    return buildComputerUseBridgeWsUrlWithTicket(remote.baseUrl, ticket, profile)
   }
-  return buildComputerUseBridgeWsUrl(remote.baseUrl, remote.token)
+  return buildComputerUseBridgeWsUrl(remote.baseUrl, remote.token, profile)
 }
 
 function sendComputerUseBridgeReply(ws, id, payload) {
@@ -3971,6 +4070,15 @@ async function handleComputerUseBridgeRequest(state, event) {
   }
 
   try {
+    if (
+      computerUseBridgeStopping ||
+      state.generation !== computerUseBridgeGeneration ||
+      computerUseBridgeState?.child !== state.child ||
+      computerUseBridgeConnections.get(state.remoteKey) !== state
+    ) {
+      throw new Error('Local Computer Use bridge is no longer available.')
+    }
+
     if (request.type === 'status') {
       const data = (await fetchComputerUseBridgeJson(state.url, state.token, '/v1/status')) as any
       sendComputerUseBridgeReply(state.ws, id, { ok: true, result: data?.status || data })
@@ -3992,21 +4100,34 @@ async function handleComputerUseBridgeRequest(state, event) {
   }
 }
 
-function scheduleComputerUseBridgeReconnect(remote) {
-  if (computerUseBridgeStopping || !remote?.computerUseBridge || computerUseBridgeReconnectTimer) {
+function computerUseBridgeRemoteKey(remote, profile) {
+  const scopedProfile = remote.source === 'profile' ? null : profile
+  return `${remote.baseUrl}|${remote.authMode}|${remote.source || ''}|${connectionScopeKey(scopedProfile) || 'current'}`
+}
+
+function scheduleComputerUseBridgeReconnect(remote, profile, remoteKey) {
+  if (
+    computerUseBridgeStopping ||
+    !remote?.computerUseBridge ||
+    !computerUseBridgeLifecycle.hasOwners(remoteKey) ||
+    computerUseBridgeReconnectTimers.has(remoteKey)
+  ) {
     return
   }
-  computerUseBridgeReconnectTimer = setTimeout(() => {
-    computerUseBridgeReconnectTimer = null
-    void ensureRemoteComputerUseBridge(remote).catch(error =>
+  const timer = setTimeout(() => {
+    computerUseBridgeReconnectTimers.delete(remoteKey)
+    if (!computerUseBridgeLifecycle.hasOwners(remoteKey)) {
+      return
+    }
+    void ensureRemoteComputerUseBridge(remote, profile).catch(error =>
       rememberLog(`[computer-use-bridge] reconnect failed: ${error.message}`)
     )
   }, COMPUTER_USE_BRIDGE_RECONNECT_MS)
+  computerUseBridgeReconnectTimers.set(remoteKey, timer)
 }
 
-async function ensureRemoteComputerUseBridge(remote) {
+async function ensureRemoteComputerUseBridge(remote, profile = null) {
   if (!remote?.computerUseBridge) {
-    stopComputerUseBridge()
     return null
   }
   if (typeof globalThis.WebSocket !== 'function') {
@@ -4014,38 +4135,102 @@ async function ensureRemoteComputerUseBridge(remote) {
     return null
   }
 
+  // A per-profile remote override already targets a backend launched/scoped
+  // for that remote profile, so its trusted scope is the backend's "current"
+  // profile. App-global remotes serve multiple profiles in one process and
+  // need the selected profile carried explicitly (matching the RPC routing
+  // rules in pathWithGlobalRemoteProfile).
+  profile = remote.source === 'profile' ? null : profile
+  const remoteKey = computerUseBridgeRemoteKey(remote, profile)
+  if (!computerUseBridgeLifecycle.hasOwners(remoteKey)) {
+    return null
+  }
+  const existing = computerUseBridgeConnections.get(remoteKey)
+  if (existing?.ws && [0, 1].includes(existing.ws.readyState)) {
+    return existing
+  }
+  const pending = computerUseBridgeConnectionPromises.get(remoteKey)
+  if (pending) {
+    return pending
+  }
+
   computerUseBridgeStopping = false
+  const generation = computerUseBridgeGeneration
+  const scopedGeneration = computerUseBridgeLifecycle.generation(remoteKey)
+  const connectionPromise = connectRemoteComputerUseBridge(remote, profile, remoteKey, generation, scopedGeneration)
+  computerUseBridgeConnectionPromises.set(remoteKey, connectionPromise)
+  try {
+    return await connectionPromise
+  } catch (error) {
+    scheduleBridgeReconnectIfCurrent({
+      lifecycle: computerUseBridgeLifecycle,
+      remoteKey,
+      stopping: computerUseBridgeStopping,
+      enabled: Boolean(remote?.computerUseBridge),
+      capturedGlobalGeneration: generation,
+      currentGlobalGeneration: computerUseBridgeGeneration,
+      capturedScopedGeneration: scopedGeneration,
+      scheduleReconnect: () => scheduleComputerUseBridgeReconnect(remote, profile, remoteKey)
+    })
+    throw error
+  } finally {
+    if (computerUseBridgeConnectionPromises.get(remoteKey) === connectionPromise) {
+      computerUseBridgeConnectionPromises.delete(remoteKey)
+    }
+  }
+}
+
+async function connectRemoteComputerUseBridge(remote, profile, remoteKey, generation, scopedGeneration) {
   const local = await ensureLocalComputerUseBridgeSidecar()
-  const remoteKey = `${remote.baseUrl}|${remote.authMode}|${remote.source || ''}`
-  const existing = computerUseBridgeState
-  if (existing?.remoteKey === remoteKey && existing?.ws && [0, 1].includes(existing.ws.readyState)) {
+  if (
+    computerUseBridgeStopping ||
+    generation !== computerUseBridgeGeneration ||
+    !computerUseBridgeLifecycle.isCurrent(remoteKey, scopedGeneration)
+  ) {
+    return null
+  }
+  const existing = computerUseBridgeConnections.get(remoteKey)
+  if (existing?.ws && [0, 1].includes(existing.ws.readyState)) {
     return existing
   }
 
-  closeComputerUseBridgeSocket()
-  const wsUrl = await buildRemoteComputerUseBridgeWsUrl(remote)
+  closeComputerUseBridgeSocket(remoteKey)
+  const wsUrl = await buildRemoteComputerUseBridgeWsUrl(remote, profile)
+  if (
+    computerUseBridgeStopping ||
+    generation !== computerUseBridgeGeneration ||
+    !computerUseBridgeLifecycle.isCurrent(remoteKey, scopedGeneration)
+  ) {
+    return null
+  }
   const WebSocketImpl = globalThis.WebSocket as any
   const ws = new WebSocketImpl(wsUrl)
   const state = {
-    ...(computerUseBridgeState || {}),
     ...local,
+    generation,
     remoteKey,
     remoteBaseUrl: remote.baseUrl,
+    profile: connectionScopeKey(profile) || null,
     ws
   }
-  computerUseBridgeState = state
+  computerUseBridgeConnections.set(remoteKey, state)
 
   await new Promise((resolve, reject) => {
     let settled = false
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true
+        // A connect timeout is a transient transport failure. Keep this
+        // owned, enabled scope eligible for the close handler's retry path.
+        closeComputerUseBridgeSocket(remoteKey, true)
         reject(new Error('Timed out connecting local Computer Use bridge to remote backend.'))
       }
     }, 8_000)
 
     ws.addEventListener('open', () => {
-      rememberLog(`[computer-use-bridge] connected local Computer Use bridge to ${remote.baseUrl}`)
+      rememberLog(
+        `[computer-use-bridge] connected local Computer Use bridge to ${remote.baseUrl} for profile "${state.profile || 'current'}"`
+      )
       if (!settled) {
         settled = true
         clearTimeout(timer)
@@ -4063,15 +4248,17 @@ async function ensureRemoteComputerUseBridge(remote) {
     })
     ws.addEventListener('close', event => {
       rememberLog(`[computer-use-bridge] websocket closed (${event?.code || 'unknown'})`)
-      if (computerUseBridgeState?.ws === ws) {
-        computerUseBridgeState = { ...computerUseBridgeState, ws: null, remoteKey: null }
+      if (computerUseBridgeConnections.get(remoteKey)?.ws === ws) {
+        computerUseBridgeConnections.delete(remoteKey)
       }
       if (!settled) {
         settled = true
         clearTimeout(timer)
         reject(new Error('Computer Use bridge WebSocket closed before it became ready.'))
       }
-      scheduleComputerUseBridgeReconnect(remote)
+      if (!state.closedByDesktop) {
+        scheduleComputerUseBridgeReconnect(remote, profile, remoteKey)
+      }
     })
   })
 
@@ -5717,7 +5904,13 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
       continue
     }
 
-    const cleaned: { mode: 'remote' | 'local'; url?: string; authMode?: string; token?: object; computerUseBridge?: boolean } = {
+    const cleaned: {
+      mode: 'remote' | 'local'
+      url?: string
+      authMode?: string
+      token?: object
+      computerUseBridge?: boolean
+    } = {
       mode: entry.mode === 'remote' ? 'remote' : 'local'
     }
     const url = String(entry.url || '').trim()
@@ -5926,7 +6119,12 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   const nextRemote =
     mode === 'remote'
       ? buildRemoteBlock(remoteUrl, authMode, nextToken, computerUseBridge)
-      : { url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl, authMode, token: nextToken, computerUseBridge }
+      : {
+          url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl,
+          authMode,
+          token: nextToken,
+          computerUseBridge
+        }
 
   // Preserve per-profile overrides when saving the global connection.
   return { mode, remote: nextRemote, profiles: existing.profiles || {} }
@@ -6040,7 +6238,10 @@ async function resolveRemoteBackend(profile) {
     }
 
     return buildRemoteConnection(rawEnvUrl, 'token', rawEnvToken, 'env', {
-      computerUseBridge: process.env.HERMES_DESKTOP_REMOTE_COMPUTER_USE_BRIDGE !== '0'
+      // Enablement is behavioral Desktop configuration even when the legacy
+      // URL/token env override supplies connectivity. Keep the safe default
+      // on, while honoring the persisted Gateway setting as the explicit off.
+      computerUseBridge: config.remote?.computerUseBridge !== false
     })
   }
 
@@ -6257,26 +6458,43 @@ function stopBackendChild(child) {
 }
 
 function resetHermesConnection() {
+  const startup = primaryStartupLifecycle.cancel()
   connectionPromise = null
   backendStartFailure = null
-  stopComputerUseBridge()
+  // Reset only primary bridge ownership; pooled profiles own their sockets.
+  stopPrimaryComputerUseBridge()
 
   stopBackendChild(hermesProcess)
 
   hermesProcess = null
   resetBootProgressForReconnect()
+
+  return startup
 }
 
-// Re-home the primary backend: reset connection state, then wait for the live
-// dashboard process to actually exit (SIGKILL after 5s) so the next
-// startHermes() spawns fresh instead of racing the dying one. Shared by the
-// connection-config and profile switch flows.
-async function teardownPrimaryBackendAndWait() {
+// Re-home the primary backend: cancel and join the captured startup/bootstrap,
+// then wait for the live dashboard process to actually exit (SIGKILL after 5s).
+// startHermes() joins primaryTeardownPromise before beginning a new generation,
+// so renderer reload/reconnect calls cannot overlap installer writes. Shared by
+// the bootstrap reset, connection-config, and profile switch flows.
+function teardownPrimaryBackendAndWait(): Promise<void> {
+  if (primaryTeardownPromise) {
+    return primaryTeardownPromise
+  }
+
   // Capture the reference before resetHermesConnection() nulls hermesProcess.
   const dying = hermesProcess && !hermesProcess.killed ? hermesProcess : null
-  resetHermesConnection()
+  const startup = resetHermesConnection()
+  const teardown = Promise.all([abortAndWaitForPrimaryStartup(startup), waitForBackendExit(dying)]).then(() => {})
+  let trackedTeardown: Promise<void>
 
-  await waitForBackendExit(dying)
+  trackedTeardown = teardown.finally(() => {
+    if (primaryTeardownPromise === trackedTeardown) {
+      primaryTeardownPromise = null
+    }
+  })
+  primaryTeardownPromise = trackedTeardown
+  return trackedTeardown
 }
 
 async function waitForBackendExit(child, timeoutMs = 5000) {
@@ -6338,9 +6556,21 @@ async function ensureBackend(profile) {
 
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
-  const entry = { process: null, port: null, token: null, connectionPromise: null, lastActiveAt: Date.now() }
+  const entry = {
+    process: null,
+    port: null,
+    token: null,
+    connectionPromise: null,
+    computerUseBridgeRemoteKey: null,
+    computerUseBridgeOwner: `pool:${key}`,
+    lastActiveAt: Date.now(),
+    stopped: false
+  }
   entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
-    backendPool.delete(key)
+    if (backendPool.get(key) === entry) {
+      backendPool.delete(key)
+    }
+    stopRemoteComputerUseBridge(entry.computerUseBridgeRemoteKey, entry.computerUseBridgeOwner)
     throw error
   })
   backendPool.set(key, entry)
@@ -6430,9 +6660,16 @@ async function spawnPoolBackend(profile, entry) {
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token)
-    if (remote.computerUseBridge) {
-      await ensureRemoteComputerUseBridge(remote).catch(error => {
-        rememberLog(`[computer-use-bridge] remote bridge setup failed for profile "${profile}": ${error.message || error}`)
+    // stopPoolBackend may have removed this entry while remote liveness or an
+    // OAuth ticket was in flight. Never let that stale continuation recreate
+    // a connector for a disabled/deleted/evicted profile.
+    if (remote.computerUseBridge && !entry.stopped && backendPool.get(profile) === entry) {
+      entry.computerUseBridgeRemoteKey = computerUseBridgeRemoteKey(remote, profile)
+      computerUseBridgeLifecycle.acquire(entry.computerUseBridgeRemoteKey, entry.computerUseBridgeOwner)
+      await ensureRemoteComputerUseBridge(remote, profile).catch(error => {
+        rememberLog(
+          `[computer-use-bridge] remote bridge setup failed for profile "${profile}": ${error.message || error}`
+        )
       })
     }
 
@@ -6547,23 +6784,28 @@ async function spawnPoolBackend(profile, entry) {
 }
 
 function stopPoolBackend(profile) {
-  const entry = backendPool.get(profile)
-
+  const entry = detachBridgeOwnedPoolEntry(
+    backendPool,
+    profile,
+    computerUseBridgeLifecycle,
+    stopLocalComputerUseBridgeSidecar
+  )
   if (!entry) {
     return
   }
-  backendPool.delete(profile)
   stopBackendChild(entry.process)
 }
 
 async function teardownPoolBackendAndWait(profile) {
-  const entry = backendPool.get(profile)
-
+  const entry = detachBridgeOwnedPoolEntry(
+    backendPool,
+    profile,
+    computerUseBridgeLifecycle,
+    stopLocalComputerUseBridgeSidecar
+  )
   if (!entry) {
     return
   }
-  backendPool.delete(profile)
-
   stopBackendChild(entry.process)
 
   await waitForBackendExit(entry.process)
@@ -6630,7 +6872,30 @@ async function prepareProfileDeleteRequest(request) {
   return profile
 }
 
+async function awaitPrimaryStartupPhase<T>(generation: number, phase: Promise<T>): Promise<T> {
+  try {
+    const result = await phase
+    primaryStartupLifecycle.assertCurrent(generation)
+    return result
+  } catch (error) {
+    // Prefer cancellation over a late phase error once reset/profile apply/quit
+    // has superseded this startup. The caller then skips global failure state.
+    if (!primaryStartupLifecycle.isCurrent(generation)) {
+      throw new PrimaryStartupCancelledError(error)
+    }
+    throw error
+  }
+}
+
 async function startHermes() {
+  // A renderer reload can ask for a connection before reset/profile re-home
+  // teardown has finished joining the old installer/startup. Wait outside a
+  // startup generation so teardown can never end up awaiting this call.
+  const teardown = primaryTeardownPromise
+  if (teardown) {
+    await teardown
+  }
+
   // Latched-failure short-circuit: once bootstrap has failed in this
   // process, every subsequent startHermes() call re-throws the same error
   // without re-running install.ps1. This prevents the renderer's
@@ -6649,23 +6914,53 @@ async function startHermes() {
     return connectionPromise
   }
 
-  connectionPromise = (async () => {
-    await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
+  const startupGeneration = primaryStartupLifecycle.begin()
+  const activeProfile = readActiveDesktopProfile()
+  const primaryProfile = activeProfile || 'default'
+  let startupChild = null
+  let startupReadyFile = null
+  let startupPromise = null
+
+  const startupOperation = (async () => {
+    await awaitPrimaryStartupPhase(
+      startupGeneration,
+      advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
+    )
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
-    const remote = await resolveRemoteBackend(primaryProfileKey())
+    const remote = await awaitPrimaryStartupPhase(startupGeneration, resolveRemoteBackend(primaryProfile))
 
     if (remote) {
-      await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token)
+      await awaitPrimaryStartupPhase(
+        startupGeneration,
+        advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
+      )
+      await awaitPrimaryStartupPhase(startupGeneration, waitForHermes(remote.baseUrl, remote.token))
       if (remote.computerUseBridge) {
-        await advanceBootProgress('backend.computer-use-bridge', 'Connecting local Computer Use bridge', 72)
-        await ensureRemoteComputerUseBridge(remote).catch(error => {
-          rememberLog(`[computer-use-bridge] remote bridge setup failed: ${error.message || error}`)
-        })
+        // Ownership is global mutable state. Do not attach after a re-home or
+        // quit invalidated this startup while the remote probe was in flight.
+        primaryStartupLifecycle.assertCurrent(startupGeneration)
+        const remoteKey = computerUseBridgeRemoteKey(remote, primaryProfile)
+        if (primaryComputerUseBridgeRemoteKey && primaryComputerUseBridgeRemoteKey !== remoteKey) {
+          stopRemoteComputerUseBridge(primaryComputerUseBridgeRemoteKey, PRIMARY_COMPUTER_USE_BRIDGE_OWNER)
+        }
+        primaryComputerUseBridgeRemoteKey = remoteKey
+        computerUseBridgeLifecycle.acquire(remoteKey, PRIMARY_COMPUTER_USE_BRIDGE_OWNER)
+        await awaitPrimaryStartupPhase(
+          startupGeneration,
+          advanceBootProgress('backend.computer-use-bridge', 'Connecting local Computer Use bridge', 72)
+        )
+        await awaitPrimaryStartupPhase(
+          startupGeneration,
+          ensureRemoteComputerUseBridge(remote, primaryProfile).catch(error => {
+            rememberLog(`[computer-use-bridge] remote bridge setup failed: ${error.message || error}`)
+          })
+        )
       } else {
-        stopComputerUseBridge()
+        primaryStartupLifecycle.assertCurrent(startupGeneration)
+        stopPrimaryComputerUseBridge()
       }
+      primaryStartupLifecycle.assertCurrent(startupGeneration)
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -6674,6 +6969,9 @@ async function startHermes() {
         error: null
       })
 
+      // This return resolves the cached primary connection promise. Keep the
+      // final commit behind the same generation guard as bridge ownership.
+      primaryStartupLifecycle.assertCurrent(startupGeneration)
       return {
         baseUrl: remote.baseUrl,
         mode: 'remote',
@@ -6687,7 +6985,8 @@ async function startHermes() {
       }
     }
 
-    stopComputerUseBridge()
+    primaryStartupLifecycle.assertCurrent(startupGeneration)
+    stopPrimaryComputerUseBridge()
 
     // Mutual exclusion with an in-app update (#50238). If this instance was
     // relaunched while the Tauri updater is still applying an update, spawning
@@ -6695,7 +6994,7 @@ async function startHermes() {
     // updater's straggler cleanup — looping. Park until the update finishes (or
     // is detected stale), THEN start the backend. Local backends only; remote
     // connections returned above and never touch the install tree.
-    await waitForUpdateToFinish()
+    await awaitPrimaryStartupPhase(startupGeneration, waitForUpdateToFinish())
 
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
@@ -6705,23 +7004,32 @@ async function startHermes() {
     // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
     // unset preference keeps the legacy launch so existing installs are
     // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
     if (activeProfile) {
       backendArgs.unshift('--profile', activeProfile)
     }
 
-    await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
-    const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+    await awaitPrimaryStartupPhase(
+      startupGeneration,
+      advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
+    )
+    const backend = await awaitPrimaryStartupPhase(
+      startupGeneration,
+      ensureRuntime(resolveHermesBackend(backendArgs), startupGeneration)
+    )
     // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
     const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+    startupReadyFile = readyFile
 
-    await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
+    await awaitPrimaryStartupPhase(
+      startupGeneration,
+      advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
+    )
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
+    primaryStartupLifecycle.assertCurrent(startupGeneration)
     hermesProcess = spawn(
       backend.command,
       backend.args,
@@ -6751,9 +7059,11 @@ async function startHermes() {
         stdio: ['ignore', 'pipe', 'pipe']
       })
     )
+    const child = hermesProcess
+    startupChild = child
 
-    hermesProcess.stdout.on('data', rememberLog)
-    hermesProcess.stderr.on('data', rememberLog)
+    child.stdout.on('data', rememberLog)
+    child.stderr.on('data', rememberLog)
     let backendReady = false
     let rejectBackendStart = null
 
@@ -6761,39 +7071,51 @@ async function startHermes() {
       rejectBackendStart = reject
     })
 
-    hermesProcess.once('error', error => {
-      rememberLog(`Hermes backend failed to start: ${error.message}`)
-      updateBootProgress(
-        {
-          error: error.message,
-          message: `Hermes backend failed to start: ${error.message}`,
-          phase: 'backend.error',
-          running: false
-        },
-        { allowDecrease: true }
-      )
-      hermesProcess = null
-      connectionPromise = null
-      sendBackendExit({ code: null, signal: null, error: error.message })
-      rejectBackendStart?.(error)
-    })
-    hermesProcess.once('exit', (code, signal) => {
-      rememberLog(`Hermes backend exited (${signal || code})`)
-      hermesProcess = null
-      connectionPromise = null
-      sendBackendExit({ code, signal })
+    const ownsPrimaryChild = () =>
+      primaryStartupLifecycle.isCurrent(startupGeneration) &&
+      connectionPromise === startupPromise &&
+      hermesProcess === child
 
-      if (!backendReady) {
-        const message = `Hermes backend exited before it became ready (${signal || code}).`
+    child.once('error', error => {
+      rememberLog(`Hermes backend failed to start: ${error.message}`)
+      if (ownsPrimaryChild()) {
         updateBootProgress(
           {
-            error: message,
-            message,
+            error: error.message,
+            message: `Hermes backend failed to start: ${error.message}`,
             phase: 'backend.error',
             running: false
           },
           { allowDecrease: true }
         )
+        hermesProcess = null
+        connectionPromise = null
+        sendBackendExit({ code: null, signal: null, error: error.message })
+      }
+      rejectBackendStart?.(error)
+    })
+    child.once('exit', (code, signal) => {
+      rememberLog(`Hermes backend exited (${signal || code})`)
+      const ownsPrimary = ownsPrimaryChild()
+      if (ownsPrimary) {
+        hermesProcess = null
+        connectionPromise = null
+        sendBackendExit({ code, signal })
+      }
+
+      if (!backendReady) {
+        const message = `Hermes backend exited before it became ready (${signal || code}).`
+        if (ownsPrimary) {
+          updateBootProgress(
+            {
+              error: message,
+              message,
+              phase: 'backend.error',
+              running: false
+            },
+            { allowDecrease: true }
+          )
+        }
         rejectBackendStart?.(
           new Error(
             `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
@@ -6802,30 +7124,40 @@ async function startHermes() {
       }
     })
 
-    await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
+    await awaitPrimaryStartupPhase(
+      startupGeneration,
+      advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
+    )
 
     // Discover the ephemeral port the child bound to
-    const port = await Promise.race([
-      waitForDashboardPortAnnouncement(hermesProcess, { readyFile }),
-      backendStartFailed
-    ])
+    const port = await awaitPrimaryStartupPhase(
+      startupGeneration,
+      Promise.race([waitForDashboardPortAnnouncement(child, { readyFile }), backendStartFailed])
+    )
 
     if (readyFile) {
       fs.unlink(readyFile, () => {})
+      startupReadyFile = null
     }
 
     const baseUrl = `http://127.0.0.1:${port}`
-    await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
-    await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
+    await awaitPrimaryStartupPhase(
+      startupGeneration,
+      advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
+    )
+    await awaitPrimaryStartupPhase(startupGeneration, Promise.race([waitForHermes(baseUrl, token), backendStartFailed]))
     backendReady = true
     backendStartFailure = null
 
-    const authToken = await adoptServedDashboardToken(baseUrl, token, {
-      // The exit/error handlers null hermesProcess when the child dies.
-      childAlive: () => hermesProcess !== null && hermesProcess.exitCode === null && !hermesProcess.killed,
-      rememberLog
-    })
+    const authToken = await awaitPrimaryStartupPhase(
+      startupGeneration,
+      adoptServedDashboardToken(baseUrl, token, {
+        childAlive: () => child.exitCode === null && !child.killed,
+        rememberLog
+      })
+    )
 
+    primaryStartupLifecycle.assertCurrent(startupGeneration)
     updateBootProgress({
       phase: 'backend.ready',
       message: 'Hermes backend is ready. Finalizing desktop startup',
@@ -6834,6 +7166,7 @@ async function startHermes() {
       error: null
     })
 
+    primaryStartupLifecycle.assertCurrent(startupGeneration)
     return {
       baseUrl,
       mode: 'local',
@@ -6844,7 +7177,31 @@ async function startHermes() {
       logs: hermesLog.slice(-80),
       ...getWindowState()
     }
-  })().catch(error => {
+  })()
+
+  startupPromise = startupOperation.catch(error => {
+    if (!primaryStartupLifecycle.isCurrent(startupGeneration)) {
+      // Reset already released primary bridge ownership. Only stop resources
+      // this invocation created; owner-key cleanup here could release a newer
+      // startup that legitimately reacquired the same remote bridge scope.
+      stopBackendChild(startupChild)
+      if (startupChild && hermesProcess === startupChild) {
+        hermesProcess = null
+      }
+      if (startupReadyFile) {
+        fs.unlink(startupReadyFile, () => {})
+        startupReadyFile = null
+      }
+      if (connectionPromise === startupPromise) {
+        connectionPromise = null
+      }
+      const startupCause = error instanceof PrimaryStartupCancelledError ? error.startupCause : error
+      if (bootstrapFailure === startupCause) {
+        bootstrapFailure = null
+      }
+      throw error instanceof PrimaryStartupCancelledError ? error : new PrimaryStartupCancelledError()
+    }
+
     const message = error instanceof Error ? error.message : String(error)
     backendStartFailure = error instanceof Error ? error : new Error(message)
     updateBootProgress(
@@ -6856,11 +7213,15 @@ async function startHermes() {
       },
       { allowDecrease: true }
     )
-    connectionPromise = null
+    if (connectionPromise === startupPromise) {
+      connectionPromise = null
+    }
     throw error
   })
 
-  return connectionPromise
+  primaryStartupLifecycle.captureStart(startupGeneration, startupPromise)
+  connectionPromise = startupPromise
+  return startupPromise
 }
 
 // Shared navigation guards + window chrome wiring applied to every window
@@ -7496,17 +7857,17 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   // reloads afterwards to re-drive the boot flow from scratch.
   rememberLog('[bootstrap] repair requested by renderer; clearing marker + latched failure')
 
-  try {
-    if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
-      fs.rmSync(BOOTSTRAP_COMPLETE_MARKER, { force: true })
-    }
-  } catch (error) {
-    rememberLog(`[bootstrap] failed to remove marker during repair: ${error.message}`)
-  }
-
   bootstrapFailure = null
   backendStartFailure = null
-  resetHermesConnection()
+  await removeBootstrapMarkerAfterTeardown(
+    teardownPrimaryBackendAndWait(),
+    () => {
+      if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
+        fs.rmSync(BOOTSTRAP_COMPLETE_MARKER, { force: true })
+      }
+    },
+    error => rememberLog(`[bootstrap] failed to remove marker during repair: ${(error as Error).message}`)
+  )
 
   return { ok: true }
 })
@@ -8927,6 +9288,7 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  primaryStartupLifecycle.stop()
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
@@ -8955,6 +9317,7 @@ app.on('before-quit', () => {
   }
 
   stopBackendChild(hermesProcess)
+  connectionPromise = null
   stopComputerUseBridge()
   stopAllPoolBackends()
 })

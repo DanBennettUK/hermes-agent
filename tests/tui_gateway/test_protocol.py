@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import types
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1076,6 +1077,9 @@ def test_session_activate_rebinds_orphaned_ws_session_to_current_transport(serve
     """Reconnect + activate must reattach a parked live session before orphan reap."""
 
     class _Transport:
+        authenticated_principal = ("dashboard-token", "local-session")
+        allow_profile_override = True
+
         def write(self, _obj):
             return True
 
@@ -1110,6 +1114,2029 @@ def test_session_activate_rebinds_orphaned_ws_session_to_current_transport(serve
     assert not server._ws_session_is_orphaned(server._sessions[sid])
 
 
+class _PrincipalTransport:
+    def __init__(self, subject: str):
+        self.authenticated_principal = ("stub", subject)
+        self.authorized_profile = "default"
+        self.allow_profile_override = False
+
+    def write(self, _obj):
+        return True
+
+
+def _ticket_ws_transport(subject: str = "alice", *, operator: bool = False):
+    """Build the real transport class stamped by the WS ticket boundary."""
+    from tui_gateway.ws import WSTransport
+
+    return WSTransport(
+        MagicMock(),
+        MagicMock(),
+        peer="ticket-test",
+        authenticated_principal=(
+            ("dashboard-token", subject) if operator else ("stub", subject)
+        ),
+        authorized_profile="default",
+        allow_profile_override=operator,
+    )
+
+
+def test_authenticated_session_create_binds_principal_and_rejects_cross_profile(
+    server, monkeypatch, tmp_path
+):
+    transport = _PrincipalTransport("alice")
+    monkeypatch.setattr(server, "current_transport", lambda: transport)
+    monkeypatch.setattr(server, "_default_session_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(server, "_completion_cwd", lambda _params=None: str(tmp_path))
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", lambda *_args, **_kwargs: (None, None)
+    )
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    denied = server.handle_request(
+        {
+            "id": "deny",
+            "method": "session.create",
+            "params": {"profile": "work", "source": "desktop"},
+        }
+    )
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "requested profile is not authorized for this authenticated transport",
+    }
+    assert server._sessions == {}
+
+    allowed = server.handle_request(
+        {"id": "allow", "method": "session.create", "params": {"source": "desktop"}}
+    )
+    sid = allowed["result"]["session_id"]
+    session = server._sessions[sid]
+    assert session["authenticated_principal"] == ("stub", "alice")
+    assert session["profile"] == "default"
+    assert session["transport"] is transport
+
+    # Desktop may echo the workspace it learned from the server.  A matching
+    # hint remains compatible, while the handler still derives the actual cwd
+    # from server state rather than probing the request value.
+    matching = server.handle_request(
+        {
+            "id": "matching-cwd",
+            "method": "session.create",
+            "params": {"cwd": str(tmp_path), "source": "desktop"},
+        }
+    )
+    matching_session = server._sessions[matching["result"]["session_id"]]
+    assert matching_session["cwd"] == str(tmp_path)
+    assert matching_session["explicit_cwd"] is True
+
+
+def test_public_session_create_rejects_ungranted_cwd_before_filesystem_probe(
+    server, monkeypatch, tmp_path
+):
+    trusted = tmp_path / "trusted"
+    foreign = tmp_path / "foreign"
+    trusted.mkdir()
+    foreign.mkdir()
+    monkeypatch.setattr(server, "_default_session_cwd", lambda: str(trusted))
+    monkeypatch.setattr(
+        server,
+        "_completion_cwd",
+        lambda _params=None: pytest.fail("denied create reached cwd resolution"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda *_args, **_kwargs: pytest.fail("denied create claimed a session slot"),
+    )
+
+    denied = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "foreign-create",
+            "method": "session.create",
+            "params": {"cwd": str(foreign), "source": "desktop"},
+        },
+    )
+
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "public cwd override is not authorized; use the server-selected workspace",
+    }
+    assert server._sessions == {}
+
+
+def test_public_pet_mutation_rejects_other_existing_profile(
+    server, monkeypatch, tmp_path
+):
+    """A verified public principal cannot turn params.profile into authority."""
+    from hermes_cli import profiles as profiles_mod
+
+    work_home = tmp_path / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    config_path = work_home / "config.yaml"
+    config_path.write_text("display:\n  pet:\n    slug: untouched\n", encoding="utf-8")
+
+    monkeypatch.setattr(server, "current_transport", lambda: _PrincipalTransport("alice"))
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda name: str(name))
+    monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda _name: None)
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda name: name == "work")
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda _name: work_home)
+
+    denied = server.handle_request(
+        {
+            "id": "pet-deny",
+            "method": "pet.select",
+            "params": {"profile": "work", "slug": "hijacked"},
+        }
+    )
+
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "public authenticated transport is not authorized for RPC method: pet.select",
+    }
+    assert config_path.read_text(encoding="utf-8") == (
+        "display:\n  pet:\n    slug: untouched\n"
+    )
+
+
+def _owned_live_session(server, owner: str, *, running: bool = False) -> dict:
+    return {
+        "agent": types.SimpleNamespace(model="test/model", interrupt=lambda: None),
+        "authenticated_principal": ("stub", owner),
+        "cols": 80,
+        "created_at": 123.0,
+        "history": [{"role": "user", "content": "hello"}],
+        "history_lock": threading.RLock(),
+        "last_active": 123.0,
+        "profile": "default",
+        "profile_home": None,
+        "running": running,
+        "session_key": "20260713_010101_owned",
+        "source": "desktop",
+        "transport": _PrincipalTransport(owner),
+    }
+
+
+def test_public_tools_configure_requires_owned_live_session(server, monkeypatch):
+    """Only a verified live session may select the profile config to mutate."""
+    transport = _PrincipalTransport("alice")
+    monkeypatch.setattr(server, "current_transport", lambda: transport)
+
+    denied_missing = server.handle_request(
+        {
+            "id": "missing",
+            "method": "tools.configure",
+            "params": {"action": "disable", "names": ["web"]},
+        }
+    )
+    denied_unknown = server.handle_request(
+        {
+            "id": "unknown",
+            "method": "tools.configure",
+            "params": {
+                "session_id": "invented",
+                "action": "disable",
+                "names": ["web"],
+            },
+        }
+    )
+
+    foreign_sid = "foreign-tools"
+    server._sessions[foreign_sid] = _owned_live_session(server, "bob")
+    denied_foreign = server.handle_request(
+        {
+            "id": "foreign",
+            "method": "tools.configure",
+            "params": {
+                "session_id": foreign_sid,
+                "action": "disable",
+                "names": ["web"],
+            },
+        }
+    )
+
+    assert denied_missing["error"]["code"] == 4033
+    assert denied_unknown["error"]["code"] == 4033
+    assert denied_foreign["error"] == {
+        "code": 4033,
+        "message": "session belongs to a different authenticated principal",
+    }
+
+
+def _handle_with_transport(server, transport, request):
+    token = server.bind_transport(transport)
+    try:
+        return server.handle_request(request)
+    finally:
+        server.reset_transport(token)
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("shell.exec", {"command": "printf should-not-run"}),
+        ("cli.exec", {"argv": ["status"]}),
+        ("model.save_key", {"provider": "openai", "key": "secret"}),
+        ("model.disconnect", {"provider": "openai"}),
+        ("process.stop", {}),
+        ("cron.manage", {"action": "add", "name": "bad", "schedule": "* * * * *"}),
+        ("plugins.manage", {"action": "toggle", "name": "demo", "enable": True}),
+        ("learning.delete", {"id": "memory:1"}),
+        ("learning.edit", {"id": "memory:1", "content": "changed"}),
+        ("projects.list", {}),
+        ("projects.tree", {"preview_limit": 3}),
+        ("projects.project_sessions", {"project_id": "private-project"}),
+    ],
+    ids=(
+        "shell",
+        "cli",
+        "credential-write",
+        "credential-delete",
+        "process-kill-all",
+        "cron-mutation",
+        "plugin-mutation",
+        "learning-delete",
+        "learning-edit",
+        "projects-list",
+        "projects-tree",
+        "project-sessions",
+    ),
+)
+def test_public_ticket_denies_sessionless_operator_rpc(server, method, params):
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {"id": method, "method": method, "params": params},
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": f"public authenticated transport is not authorized for RPC method: {method}",
+    }
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["projects.list", "projects.tree", "projects.project_sessions"],
+)
+def test_operator_transport_keeps_project_reads(server, monkeypatch, method):
+    called = []
+
+    def project_read(rid, params):
+        called.append(dict(params))
+        return server._ok(rid, {"operator": True})
+
+    monkeypatch.setitem(server._methods, method, project_read)
+    response = _handle_with_transport(
+        server,
+        types.SimpleNamespace(
+            authenticated_principal=("dashboard-token", "local"),
+            authorized_profile="default",
+            allow_profile_override=True,
+        ),
+        {"id": method, "method": method, "params": {"probe": method}},
+    )
+
+    assert response["result"] == {"operator": True}
+    assert called == [{"probe": method}]
+
+
+def test_public_ticket_denies_global_yolo_even_with_owned_live_session(
+    server, monkeypatch
+):
+    sid = "owned-yolo"
+    server._sessions[sid] = _owned_live_session(server, "alice")
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "global-yolo",
+            "method": "config.set",
+            "params": {
+                "key": "yolo",
+                "scope": "global",
+                "session_id": sid,
+                "value": "1",
+            },
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": "public config.set is limited to session-scoped model, fast, reasoning, and yolo changes",
+    }
+
+
+def test_public_ticket_model_and_fast_changes_do_not_persist_profile_config(
+    server, monkeypatch
+):
+    sid = "owned-config"
+    session = _owned_live_session(server, "alice")
+    session["agent"].service_tier = "priority"
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    captured = {}
+
+    def apply_model_switch(*_args, **kwargs):
+        captured["persist_override"] = kwargs.get("persist_override")
+        return {"value": "safe/model", "warning": ""}
+
+    monkeypatch.setattr(server, "_apply_model_switch", apply_model_switch)
+    monkeypatch.setattr(
+        server,
+        "_write_config_key",
+        lambda *_args, **_kwargs: pytest.fail("public session change wrote profile config"),
+    )
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda _session: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session=None: {"model": "safe/model"},
+    )
+
+    transport = _PrincipalTransport("alice")
+    model = _handle_with_transport(
+        server,
+        transport,
+        {
+            "id": "session-model",
+            "method": "config.set",
+            "params": {
+                "key": "model",
+                "session_id": sid,
+                "value": "safe/model --provider stub",
+            },
+        },
+    )
+    fast = _handle_with_transport(
+        server,
+        transport,
+        {
+            "id": "session-fast",
+            "method": "config.set",
+            "params": {"key": "fast", "session_id": sid, "value": "normal"},
+        },
+    )
+
+    assert model["result"]["value"] == "safe/model"
+    assert captured["persist_override"] is False
+    assert fast["result"]["value"] == "normal"
+    assert session["agent"].service_tier is None
+    assert session["create_service_tier_override"] == ""
+
+
+@pytest.mark.parametrize("method", ["command.dispatch", "slash.exec"])
+def test_public_ticket_denies_alias_and_slash_execution_with_owned_session(
+    server, monkeypatch, method
+):
+    sid = "owned-command"
+    server._sessions[sid] = _owned_live_session(server, "alice")
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("operator-only dispatch must stop before session access"),
+    )
+
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": method,
+            "method": method,
+            "params": {
+                "session_id": sid,
+                "name": "dangerous-alias",
+                "command": "/dangerous-alias",
+            },
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": f"public authenticated transport is not authorized for RPC method: {method}",
+    }
+
+
+def test_public_desktop_command_runs_fixed_builtin_for_owned_session(
+    server, monkeypatch
+):
+    sid = "owned-desktop-command"
+    server._sessions[sid] = _owned_live_session(server, "alice")
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(
+        server,
+        "_dispatch_dynamic_command",
+        lambda *_args, **_kwargs: pytest.fail("fixed Desktop command used dynamic dispatch"),
+    )
+
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "queue",
+            "method": "desktop.command",
+            "params": {
+                "command": "queue continue the owned chat",
+                "session_id": sid,
+            },
+        },
+    )
+
+    assert response["result"] == {
+        "type": "send",
+        "message": "continue the owned chat",
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "private-quick-command --token secret",
+        "private-alias",
+        "plugin-command",
+        "customer-secret-skill",
+        "debug",
+        "rollback 1",
+        "stop",
+        "tools disable terminal",
+    ],
+)
+def test_public_desktop_command_rejects_dynamic_and_operator_forms(
+    server, monkeypatch, command
+):
+    sid = "owned-denied-desktop-command"
+    server._sessions[sid] = _owned_live_session(server, "alice")
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(
+        server,
+        "_dispatch_dynamic_command",
+        lambda *_args, **_kwargs: pytest.fail("denied Desktop command used dynamic dispatch"),
+    )
+
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": command,
+            "method": "desktop.command",
+            "params": {"command": command, "session_id": sid},
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": f"public desktop command is not authorized: {command.split(maxsplit=1)[0]}",
+    }
+
+
+@pytest.mark.parametrize("command", ["tools", "debug", "rollback", "stop"])
+def test_operator_desktop_command_retains_legacy_fallback_signal(
+    server, monkeypatch, command
+):
+    sid = "operator-desktop-command"
+    server._sessions[sid] = _owned_live_session(server, "local")
+    monkeypatch.setattr(
+        server,
+        "_dispatch_dynamic_command",
+        lambda *_args, **_kwargs: pytest.fail(
+            "desktop.command capability probe used dynamic dispatch"
+        ),
+    )
+    operator = types.SimpleNamespace(
+        authenticated_principal=("dashboard-token", "local"),
+        authorized_profile="default",
+        allow_profile_override=True,
+    )
+
+    response = _handle_with_transport(
+        server,
+        operator,
+        {
+            "id": command,
+            "method": "desktop.command",
+            "params": {"command": command, "session_id": sid},
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4018,
+        "message": f"desktop command is not allowed: {command}",
+    }
+
+
+def test_public_desktop_command_requires_principal_owned_live_session(
+    server, monkeypatch
+):
+    sid = "foreign-desktop-command"
+    server._sessions[sid] = _owned_live_session(server, "bob")
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("foreign command must stop before session DB access"),
+    )
+
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "foreign",
+            "method": "desktop.command",
+            "params": {"command": "usage", "session_id": sid},
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": "session belongs to a different authenticated principal",
+    }
+
+
+def test_public_ticket_denies_new_unclassified_registered_method(server):
+    called = False
+
+    def future_mutator(rid, _params):
+        nonlocal called
+        called = True
+        return server._ok(rid, {"mutated": True})
+
+    server._methods["future.mutate"] = future_mutator
+    try:
+        response = _handle_with_transport(
+            server,
+            _PrincipalTransport("alice"),
+            {"id": "future", "method": "future.mutate", "params": {}},
+        )
+    finally:
+        server._methods.pop("future.mutate", None)
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": "public authenticated transport is not authorized for RPC method: future.mutate",
+    }
+    assert called is False
+
+
+def test_public_allowlists_are_registered_and_disjoint(server):
+    classes = (
+        server._PUBLIC_READ_ONLY_METHODS,
+        server._PUBLIC_OPTIONAL_LIVE_SESSION_READ_METHODS,
+        server._PUBLIC_SESSION_BOOTSTRAP_METHODS,
+        server._PUBLIC_LIVE_SESSION_METHODS,
+        server._PUBLIC_PENDING_REPLY_METHODS,
+    )
+    assert set().union(*classes) <= set(server._methods)
+    for index, methods in enumerate(classes):
+        for other in classes[index + 1 :]:
+            assert methods.isdisjoint(other)
+
+
+def test_public_ticket_does_not_expose_profile_home(server, monkeypatch):
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {"id": "profile", "method": "config.get", "params": {"key": "profile"}},
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": "public config.get is limited to project status",
+    }
+    assert "home" not in json.dumps(response)
+
+
+def test_public_commands_catalog_omits_configured_commands_and_aliases(
+    server, monkeypatch
+):
+    secret_command = "curl -H 'Authorization: Bearer catalog-secret' private"
+    secret_target = "/shell deploy --token alias-secret"
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "quick_commands": {
+                "private-deploy": {"type": "exec", "command": secret_command},
+                "private-alias": {"type": "alias", "target": secret_target},
+            }
+        },
+    )
+
+    public = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {"id": "public-catalog", "method": "commands.catalog", "params": {}},
+    )
+    serialized_public = json.dumps(public, sort_keys=True)
+    assert "/help" in dict(public["result"]["pairs"])
+    assert "User commands" not in {
+        category["name"] for category in public["result"]["categories"]
+    }
+    for private_value in (
+        "private-deploy",
+        "private-alias",
+        secret_command,
+        secret_target,
+        "catalog-secret",
+        "alias-secret",
+    ):
+        assert private_value not in serialized_public
+
+    operator = _handle_with_transport(
+        server,
+        types.SimpleNamespace(
+            authenticated_principal=("dashboard-token", "local"),
+            authorized_profile="default",
+            allow_profile_override=True,
+        ),
+        {"id": "operator-catalog", "method": "commands.catalog", "params": {}},
+    )
+    operator_pairs = dict(operator["result"]["pairs"])
+    assert secret_command in operator_pairs["/private-deploy"]
+    assert secret_target in operator_pairs["/private-alias"]
+
+
+def test_public_command_metadata_omits_profile_skills_and_bundles(
+    server, monkeypatch
+):
+    import importlib
+
+    skill_bundles = importlib.import_module("agent.skill_bundles")
+    skill_commands = importlib.import_module("agent.skill_commands")
+
+    calls = {"bundles": 0, "get_skills": 0, "scan_skills": 0}
+    secret_path = "/profiles/default/skills/customer-secret/SKILL.md"
+    secret_skill = {
+        "/customer-secret": {
+            "description": "Operate customer codename ORCHID",
+            "name": "customer-secret",
+            "skill_md_path": secret_path,
+        }
+    }
+    secret_bundle = {
+        "/merger-secret": {
+            "description": "Private merger bundle BLUEBIRD",
+            "name": "merger-secret",
+            "path": "/profiles/default/skill-bundles/merger.yaml",
+            "skills": ["customer-secret"],
+        }
+    }
+
+    def scan_skills():
+        calls["scan_skills"] += 1
+        return secret_skill
+
+    def get_skills():
+        calls["get_skills"] += 1
+        return secret_skill
+
+    def get_bundles():
+        calls["bundles"] += 1
+        return secret_bundle
+
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(skill_commands, "scan_skill_commands", scan_skills)
+    monkeypatch.setattr(skill_commands, "get_skill_commands", get_skills)
+    monkeypatch.setattr(skill_bundles, "get_skill_bundles", get_bundles)
+
+    public_transport = _PrincipalTransport("alice")
+    catalog = _handle_with_transport(
+        server,
+        public_transport,
+        {"id": "catalog", "method": "commands.catalog", "params": {}},
+    )
+    completion = _handle_with_transport(
+        server,
+        public_transport,
+        {
+            "id": "completion",
+            "method": "complete.slash",
+            "params": {"text": "/customer"},
+        },
+    )
+
+    public_serialized = json.dumps([catalog, completion], sort_keys=True)
+    for private_value in (
+        "customer-secret",
+        "ORCHID",
+        "merger-secret",
+        "BLUEBIRD",
+        secret_path,
+    ):
+        assert private_value not in public_serialized
+    assert calls == {"bundles": 0, "get_skills": 0, "scan_skills": 0}
+
+    operator = types.SimpleNamespace(
+        authenticated_principal=("dashboard-token", "local"),
+        authorized_profile="default",
+        allow_profile_override=True,
+    )
+    monkeypatch.setattr(server, "current_transport", lambda: operator)
+    monkeypatch.setattr(
+        server, "_transport_allows_profile_override", lambda _transport=None: True
+    )
+    operator_catalog = server.handle_request(
+        {"id": "operator-catalog", "method": "commands.catalog", "params": {}}
+    )
+    operator_completion = server.handle_request(
+        {
+            "id": "operator-completion",
+            "method": "complete.slash",
+            "params": {"text": "/merger"},
+        },
+    )
+    assert "/customer-secret" in dict(operator_catalog["result"]["pairs"])
+    assert any(
+        item["display"] == "/merger-secret"
+        for item in operator_completion["result"]["items"]
+    )
+    assert calls == {"bundles": 1, "get_skills": 1, "scan_skills": 1}
+
+
+def test_public_project_status_never_falls_back_to_profile_config(
+    server, monkeypatch, tmp_path
+):
+    configured = tmp_path / "configured-private-workspace"
+    configured.mkdir()
+    owned = tmp_path / "owned-workspace"
+    owned.mkdir()
+    config_reads = []
+
+    def load_cfg():
+        config_reads.append(True)
+        return {"terminal": {"cwd": str(configured)}}
+
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(server, "_load_cfg", load_cfg)
+    monkeypatch.setattr(
+        server,
+        "_git_branch_for_cwd",
+        lambda cwd: "owned-branch" if cwd == str(owned) else "configured-secret",
+    )
+
+    denied = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {"id": "no-scope", "method": "config.get", "params": {"key": "project"}},
+    )
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "a valid owned live session is required for this public RPC",
+    }
+    assert str(configured) not in json.dumps(denied)
+    assert config_reads == []
+
+    sid = "owned-project"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    denied_override = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "foreign-project",
+            "method": "config.get",
+            "params": {
+                "cwd": str(configured),
+                "key": "project",
+                "session_id": sid,
+            },
+        },
+    )
+    assert denied_override["error"] == {
+        "code": 4033,
+        "message": "public cwd override is not authorized; use the owned session workspace",
+    }
+    assert config_reads == []
+
+    allowed = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "owned",
+            "method": "config.get",
+            "params": {"key": "project", "session_id": sid},
+        },
+    )
+    assert allowed["result"] == {"cwd": str(owned), "branch": "owned-branch"}
+    assert config_reads == []
+
+    operator = _handle_with_transport(
+        server,
+        types.SimpleNamespace(
+            authenticated_principal=("dashboard-token", "local"),
+            authorized_profile="default",
+            allow_profile_override=True,
+        ),
+        {"id": "operator", "method": "config.get", "params": {"key": "project"}},
+    )
+    assert operator["result"] == {
+        "cwd": str(configured),
+        "branch": "configured-secret",
+    }
+    assert config_reads
+
+
+def test_public_path_completion_rejects_client_override_without_probing_it(
+    server, monkeypatch, tmp_path
+):
+    owned = tmp_path / "owned"
+    foreign = tmp_path / "foreign"
+    owned.mkdir()
+    foreign.mkdir()
+    (owned / "owned.txt").write_text("owned", encoding="utf-8")
+    (foreign / "foreign-secret.txt").write_text("secret", encoding="utf-8")
+
+    sid = "owned-completion"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(
+        server,
+        "_list_repo_files",
+        lambda _root: pytest.fail("denied completion walked a filesystem"),
+    )
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "completion",
+            "method": "complete.path",
+            "params": {
+                "cwd": str(foreign),
+                "session_id": sid,
+                "word": "@file:",
+            },
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": "public cwd override is not authorized; use the owned session workspace",
+    }
+
+
+def test_public_path_completion_accepts_owned_session_workspace(
+    server, monkeypatch, tmp_path
+):
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / "owned.txt").write_text("owned", encoding="utf-8")
+    sid = "owned-completion"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    response = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "completion",
+            "method": "complete.path",
+            "params": {"cwd": str(owned), "session_id": sid, "word": "@file:"},
+        },
+    )
+
+    assert "owned.txt" in json.dumps(response, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    "word",
+    ["/etc/", "~/", "../../", "escape/"],
+    ids=("absolute-etc", "home", "traversal", "symlink"),
+)
+def test_ticket_path_completion_rejects_every_workspace_escape_before_listing(
+    server, monkeypatch, tmp_path, word
+):
+    owned = tmp_path / "owned"
+    child = owned / "child"
+    outside = tmp_path / "outside"
+    child.mkdir(parents=True)
+    outside.mkdir()
+    (outside / "foreign-secret.txt").write_text("secret", encoding="utf-8")
+    (owned / "escape").symlink_to(outside, target_is_directory=True)
+
+    sid = "ticket-completion-escape"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    real_isdir = server.os.path.isdir
+    real_listdir = server.os.listdir
+
+    def guarded_isdir(path):
+        candidate = Path(path).resolve()
+        assert candidate == owned.resolve() or candidate.is_relative_to(owned.resolve())
+        return real_isdir(path)
+
+    def guarded_listdir(path):
+        candidate = Path(path).resolve()
+        assert candidate == owned.resolve() or candidate.is_relative_to(owned.resolve())
+        return real_listdir(path)
+
+    monkeypatch.setattr(server.os.path, "isdir", guarded_isdir)
+    monkeypatch.setattr(server.os, "listdir", guarded_listdir)
+
+    response = _handle_with_transport(
+        server,
+        _ticket_ws_transport(),
+        {
+            "id": word,
+            "method": "complete.path",
+            "params": {"session_id": sid, "word": word},
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": "public path completion is confined to the owned session workspace",
+    }
+
+
+def test_ticket_path_completion_lists_valid_child_and_skips_outside_symlink(
+    server, monkeypatch, tmp_path
+):
+    owned = tmp_path / "owned"
+    child = owned / "child"
+    outside = tmp_path / "outside"
+    child.mkdir(parents=True)
+    outside.mkdir()
+    (child / "owned.txt").write_text("owned", encoding="utf-8")
+    (outside / "foreign-secret.txt").write_text("secret", encoding="utf-8")
+    (child / "outside-link").symlink_to(outside, target_is_directory=True)
+
+    sid = "ticket-completion-valid"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    response = _handle_with_transport(
+        server,
+        _ticket_ws_transport(),
+        {
+            "id": "valid-child",
+            "method": "complete.path",
+            "params": {"session_id": sid, "word": "@file:child/"},
+        },
+    )
+
+    serialized = json.dumps(response, sort_keys=True)
+    assert "owned.txt" in serialized
+    assert "outside-link" not in serialized
+    assert "foreign-secret" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("method", "field"),
+    [
+        ("image.attach", "path"),
+        ("pdf.attach", "path"),
+        ("file.attach", "path"),
+        ("input.detect_drop", "text"),
+    ],
+)
+def test_ticket_raw_attachment_paths_are_denied_before_gateway_resolution(
+    server, monkeypatch, tmp_path, method, field
+):
+    owned = tmp_path / "owned"
+    outside = tmp_path / "outside"
+    owned.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("gateway secret", encoding="utf-8")
+    symlink = owned / "secret-link"
+    symlink.symlink_to(secret)
+
+    sid = "ticket-raw-attachment"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(
+        server,
+        "_resolve_gateway_attachment_path",
+        lambda _raw: pytest.fail("public raw path reached gateway resolution"),
+    )
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda _raw: pytest.fail(
+        "public raw path reached drop detection"
+    )
+    fake_cli._resolve_attachment_path = lambda _raw: pytest.fail(
+        "public raw path reached attachment resolution"
+    )
+    fake_cli._split_path_input = lambda _raw: pytest.fail(
+        "public raw path reached path parsing"
+    )
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    paths = ["/etc/passwd", str(secret), "../../outside/secret.txt", str(symlink)]
+    for raw_path in paths:
+        response = _handle_with_transport(
+            server,
+            _ticket_ws_transport(),
+            {
+                "id": f"{method}:{raw_path}",
+                "method": method,
+                "params": {"session_id": sid, field: raw_path},
+            },
+        )
+        assert response["error"]["code"] == 4033
+
+    assert session.get("attached_images", []) == []
+    assert not (owned / ".hermes" / "desktop-attachments").exists()
+
+
+def test_ticket_file_upload_uses_bytes_and_ignores_existing_gateway_path(
+    server, monkeypatch, tmp_path
+):
+    owned = tmp_path / "owned"
+    outside = tmp_path / "outside"
+    owned.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("gateway secret", encoding="utf-8")
+
+    sid = "ticket-byte-attachment"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(
+        server,
+        "_resolve_gateway_attachment_path",
+        lambda _raw: pytest.fail("public byte upload probed its path hint"),
+    )
+
+    response = _handle_with_transport(
+        server,
+        _ticket_ws_transport(),
+        {
+            "id": "byte-upload",
+            "method": "file.attach",
+            "params": {
+                "data_url": "data:text/plain;base64,dXBsb2FkZWQgYnkgYWxpY2U=",
+                "name": "note.txt",
+                "path": str(secret),
+                "session_id": sid,
+            },
+        },
+    )
+
+    staged = owned / ".hermes" / "desktop-attachments" / "note.txt"
+    assert response["result"]["uploaded"] is True
+    assert response["result"]["ref_text"] == (
+        "@file:.hermes/desktop-attachments/note.txt"
+    )
+    assert staged.read_text(encoding="utf-8") == "uploaded by alice"
+    assert secret.read_text(encoding="utf-8") == "gateway secret"
+
+
+def test_ticket_image_byte_upload_remains_available_for_owned_desktop_session(
+    server, monkeypatch, tmp_path
+):
+    sid = "ticket-image-bytes"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(tmp_path / "owned")
+    Path(session["cwd"]).mkdir()
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(server, "_hermes_home", tmp_path / "profile-home")
+    monkeypatch.setattr(server, "_allowed_image_extensions", lambda: frozenset({".png"}))
+
+    response = _handle_with_transport(
+        server,
+        _ticket_ws_transport(),
+        {
+            "id": "image-bytes",
+            "method": "image.attach_bytes",
+            "params": {
+                "content_base64": "iVBORw0KGgoA=",
+                "filename": "desktop.png",
+                "session_id": sid,
+            },
+        },
+    )
+
+    written = Path(response["result"]["path"])
+    assert response["result"]["attached"] is True
+    assert written.parent == tmp_path / "profile-home" / "images"
+    assert written.read_bytes().startswith(b"\x89PNG")
+    assert session["attached_images"] == [str(written)]
+
+
+def test_ticket_file_upload_rejects_attachment_directory_symlink_escape(
+    server, monkeypatch, tmp_path
+):
+    owned = tmp_path / "owned"
+    outside = tmp_path / "outside"
+    (owned / ".hermes").mkdir(parents=True)
+    outside.mkdir()
+    (owned / ".hermes" / "desktop-attachments").symlink_to(
+        outside, target_is_directory=True
+    )
+
+    sid = "ticket-byte-staging-symlink"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    response = _handle_with_transport(
+        server,
+        _ticket_ws_transport(),
+        {
+            "id": "staging-symlink",
+            "method": "file.attach",
+            "params": {
+                "data_url": "data:text/plain;base64,c2FmZSBieXRlcw==",
+                "name": "note.txt",
+                "session_id": sid,
+            },
+        },
+    )
+
+    assert response["error"] == {
+        "code": 4033,
+        "message": (
+            "public attachment staging directory escapes the owned session workspace"
+        ),
+    }
+    assert list(outside.iterdir()) == []
+
+
+def test_operator_transport_retains_gateway_path_attachment_flow(
+    server, monkeypatch, tmp_path
+):
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    source = owned / "operator.txt"
+    source.write_text("operator path", encoding="utf-8")
+    sid = "operator-path-attachment"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_resolve_gateway_attachment_path", lambda _raw: source)
+
+    response = _handle_with_transport(
+        server,
+        _ticket_ws_transport("local", operator=True),
+        {
+            "id": "operator-path",
+            "method": "file.attach",
+            "params": {"path": str(source), "session_id": sid},
+        },
+    )
+
+    assert response["result"]["attached"] is True
+    assert response["result"]["uploaded"] is False
+    assert response["result"]["path"] == str(source)
+    assert response["result"]["ref_text"] == "@file:operator.txt"
+
+
+def test_public_cwd_set_and_preview_override_are_denied_but_operator_cwd_set_works(
+    server, monkeypatch, tmp_path
+):
+    owned = tmp_path / "owned"
+    foreign = tmp_path / "foreign"
+    owned.mkdir()
+    foreign.mkdir()
+    sid = "cwd-boundary"
+    session = _owned_live_session(server, "alice")
+    session["cwd"] = str(owned)
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+        def update_session_cwd(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+
+    public = _PrincipalTransport("alice")
+    denied_set = _handle_with_transport(
+        server,
+        public,
+        {
+            "id": "cwd-set",
+            "method": "session.cwd.set",
+            "params": {"cwd": str(foreign), "session_id": sid},
+        },
+    )
+    denied_preview = _handle_with_transport(
+        server,
+        public,
+        {
+            "id": "preview",
+            "method": "preview.restart",
+            "params": {
+                "cwd": str(foreign),
+                "session_id": sid,
+                "url": "http://127.0.0.1:5173",
+            },
+        },
+    )
+
+    for response in (denied_set, denied_preview):
+        assert response["error"] == {
+            "code": 4033,
+            "message": "public cwd override is not authorized; use the owned session workspace",
+        }
+    assert session["cwd"] == str(owned)
+
+    operator = types.SimpleNamespace(
+        authenticated_principal=("dashboard-token", "local"),
+        authorized_profile="default",
+        allow_profile_override=True,
+    )
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *_args: None)
+    operator_set = _handle_with_transport(
+        server,
+        operator,
+        {
+            "id": "operator-cwd-set",
+            "method": "session.cwd.set",
+            "params": {"cwd": str(foreign), "session_id": sid},
+        },
+    )
+    assert operator_set["result"]["cwd"] == str(foreign)
+    assert session["cwd"] == str(foreign)
+
+
+def test_public_usage_and_readiness_do_not_perform_credentialed_probes(
+    server, monkeypatch
+):
+    from agent import account_usage
+
+    main_mod = types.ModuleType("hermes_cli.main")
+    main_mod._has_any_provider_configured = lambda: pytest.fail(
+        "public readiness invoked the operator credential check"
+    )
+    runtime_provider = types.ModuleType("hermes_cli.runtime_provider")
+    runtime_provider.resolve_runtime_provider = lambda **_kwargs: pytest.fail(
+        "public readiness probed provider runtime"
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.main", main_mod)
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.runtime_provider", runtime_provider
+    )
+
+    sid = "owned-usage"
+    server._sessions[sid] = _owned_live_session(server, "alice")
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(
+        account_usage,
+        "nous_credits_lines",
+        lambda: pytest.fail("public usage performed a credentialed portal probe"),
+    )
+    monkeypatch.setattr(server, "_public_provider_configuration_present", lambda: True)
+    transport = _PrincipalTransport("alice")
+    usage = _handle_with_transport(
+        server,
+        transport,
+        {
+            "id": "usage",
+            "method": "session.usage",
+            "params": {"session_id": sid},
+        },
+    )
+    readiness = _handle_with_transport(
+        server,
+        transport,
+        {"id": "ready", "method": "setup.runtime_check", "params": {}},
+    )
+    status = _handle_with_transport(
+        server,
+        transport,
+        {"id": "status", "method": "setup.status", "params": {}},
+    )
+
+    assert "credits_lines" not in usage["result"]
+    assert readiness["result"] == {"ok": True}
+    assert status["result"] == {"provider_configured": True}
+
+
+def test_public_ticket_owned_action_uses_server_session_profile(server, monkeypatch):
+    sid = "owned-resize"
+    owned = _owned_live_session(server, "alice")
+    server._sessions[sid] = owned
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    allowed = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "resize",
+            "method": "terminal.resize",
+            # A contradictory client profile is ignored for authorization; the
+            # server-owned live session remains bound to default.
+            "params": {"session_id": sid, "profile": "work", "cols": 132},
+        },
+    )
+    assert allowed["result"] == {"cols": 132}
+
+    owned["profile"] = "work"
+    denied = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "wrong-profile",
+            "method": "terminal.resize",
+            "params": {"session_id": sid, "profile": "default", "cols": 80},
+        },
+    )
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "requested profile is not authorized for this authenticated transport",
+    }
+    assert owned["cols"] == 132
+
+
+def test_public_pending_reply_resolves_server_owned_session(server, monkeypatch):
+    sid = "owned-prompt"
+    server._sessions[sid] = _owned_live_session(server, "alice")
+    event = threading.Event()
+    server._pending["request-1"] = (sid, event)
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    denied = _handle_with_transport(
+        server,
+        _PrincipalTransport("bob"),
+        {
+            "id": "foreign-answer",
+            "method": "clarify.respond",
+            "params": {"request_id": "request-1", "answer": "steal"},
+        },
+    )
+    assert denied["error"]["code"] == 4033
+    assert not event.is_set()
+
+    allowed = _handle_with_transport(
+        server,
+        _PrincipalTransport("alice"),
+        {
+            "id": "owned-answer",
+            "method": "clarify.respond",
+            "params": {"request_id": "request-1", "answer": "yes"},
+        },
+    )
+    assert allowed["result"] == {"status": "ok"}
+    assert server._answers["request-1"] == "yes"
+    assert event.is_set()
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        types.SimpleNamespace(
+            authenticated_principal=("dashboard-token", "local-session"),
+            allow_profile_override=True,
+        ),
+        types.SimpleNamespace(
+            authenticated_principal=("stub", "server-internal"),
+            allow_profile_override=True,
+        ),
+        None,
+    ],
+    ids=("dashboard-token", "internal", "stdio"),
+)
+def test_operator_transports_keep_sessionless_shell_exec(server, transport):
+    request = {
+        "id": "operator-shell",
+        "method": "shell.exec",
+        "params": {"command": "printf operator-ok"},
+    }
+    response = (
+        server.handle_request(request)
+        if transport is None
+        else _handle_with_transport(server, transport, request)
+    )
+
+    assert response["result"]["code"] == 0
+    assert response["result"]["stdout"] == "operator-ok"
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        types.SimpleNamespace(
+            authenticated_principal=("dashboard-token", "local"),
+            allow_profile_override=True,
+        ),
+        types.SimpleNamespace(
+            authenticated_principal=("internal", "server"),
+            allow_profile_override=True,
+        ),
+        None,
+    ],
+    ids=("dashboard-token", "internal", "stdio"),
+)
+def test_operator_tools_configure_remains_sessionless(
+    server, monkeypatch, transport
+):
+    import importlib
+
+    config_mod = importlib.import_module("hermes_cli.config")
+    tools_config_mod = importlib.import_module("hermes_cli.tools_config")
+
+    saved = []
+    monkeypatch.setattr(server, "current_transport", lambda: transport)
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    monkeypatch.setattr(config_mod, "save_config", lambda cfg: saved.append(dict(cfg)))
+    monkeypatch.setattr(
+        tools_config_mod, "CONFIGURABLE_TOOLSETS", [("web", "Web", "")]
+    )
+    monkeypatch.setattr(
+        tools_config_mod,
+        "_apply_toolset_change",
+        lambda cfg, _platform, targets, action: cfg.update(
+            {"changed": (list(targets), action)}
+        ),
+    )
+    monkeypatch.setattr(tools_config_mod, "_get_plugin_toolset_keys", lambda: set())
+    monkeypatch.setattr(tools_config_mod, "_get_platform_tools", lambda *_a, **_k: [])
+
+    response = server.handle_request(
+        {
+            "id": "operator-tools",
+            "method": "tools.configure",
+            "params": {"action": "disable", "names": ["web"]},
+        }
+    )
+
+    assert "error" not in response, response
+    assert response["result"]["reset"] is False
+    assert saved == [{"changed": (["web"], "disable")}]
+
+
+def test_session_active_list_filters_public_owner_and_authorized_profile(
+    server, monkeypatch
+):
+    alice = _owned_live_session(server, "alice")
+    alice["session_key"] = "alice-key"
+    alice["pending_title"] = "Alice default title"
+    bob = _owned_live_session(server, "bob")
+    bob["session_key"] = "bob-key"
+    other_profile = _owned_live_session(server, "alice")
+    other_profile["profile"] = "work"
+    other_profile["session_key"] = "work-private-key"
+    other_profile["pending_title"] = "Work private title"
+    other_profile["history"] = [
+        {"role": "user", "content": "work private preview"}
+    ]
+    local = _owned_live_session(server, "alice")
+    local["session_key"] = "local-key"
+    local["authenticated_principal"] = None
+    finalized = _owned_live_session(server, "alice")
+    finalized["session_key"] = "dead-key"
+    finalized["_finalized"] = True
+    server._sessions.update(
+        {
+            "alice": alice,
+            "bob": bob,
+            "work-private-id": other_profile,
+            "local": local,
+            "dead": finalized,
+        }
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "current_transport", lambda: _PrincipalTransport("alice"))
+
+    response = server.handle_request(
+        {"id": "active-public", "method": "session.active_list", "params": {}}
+    )
+
+    serialized = json.dumps(response, sort_keys=True)
+    assert [row["id"] for row in response["result"]["sessions"]] == ["alice"]
+    assert response["result"]["sessions"][0]["session_key"] == "alice-key"
+    assert response["result"]["sessions"][0]["title"] == "Alice default title"
+    for private_value in (
+        "work-private-id",
+        "work-private-key",
+        "Work private title",
+        "work private preview",
+    ):
+        assert private_value not in serialized
+
+
+def test_public_model_options_rejects_same_owner_session_from_other_profile(
+    server, monkeypatch
+):
+    default_sid = "alice-default"
+    work_sid = "alice-work"
+    server._sessions[default_sid] = _owned_live_session(server, "alice")
+    server._sessions[work_sid] = _owned_live_session(server, "alice")
+    server._sessions[work_sid]["profile"] = "work"
+    server._sessions[work_sid]["agent"].model = "work/private-model"
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    calls = []
+
+    def model_options(rid, params):
+        calls.append(dict(params))
+        return server._ok(rid, {"model": "safe/default-model", "providers": []})
+
+    monkeypatch.setitem(server._methods, "model.options", model_options)
+    transport = _PrincipalTransport("alice")
+
+    denied = _handle_with_transport(
+        server,
+        transport,
+        {
+            "id": "work-model-options",
+            "method": "model.options",
+            "params": {"session_id": work_sid},
+        },
+    )
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "requested profile is not authorized for this authenticated transport",
+    }
+    assert "work/private-model" not in json.dumps(denied)
+    assert calls == []
+
+    allowed = _handle_with_transport(
+        server,
+        transport,
+        {
+            "id": "default-model-options",
+            "method": "model.options",
+            "params": {"session_id": default_sid},
+        },
+    )
+    assert allowed["result"]["model"] == "safe/default-model"
+    assert calls == [{"session_id": default_sid}]
+
+
+def test_public_model_options_is_sanitized_and_cannot_probe_or_refresh(
+    server, monkeypatch
+):
+    from hermes_cli import inventory
+
+    calls = []
+    secret_endpoint = "https://user:catalog-secret@private.example/v1"
+    ctx = inventory.ConfigContext(
+        current_provider="custom:private",
+        current_model="private/chat-model",
+        current_base_url=secret_endpoint,
+        user_providers={},
+        custom_providers=[],
+    )
+
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(inventory, "load_picker_context", lambda: ctx)
+
+    def build_payload(_ctx, **kwargs):
+        calls.append(dict(kwargs))
+        return {
+            "model": "private/chat-model",
+            "provider": "custom:private",
+            "providers": [
+                {
+                    "api_url": secret_endpoint,
+                    "auth_type": "api_key",
+                    "authenticated": True,
+                    "capabilities": {
+                        "private/chat-model": {"fast": False, "reasoning": True}
+                    },
+                    "extra_headers": {"Authorization": "Bearer header-secret"},
+                    "is_current": True,
+                    "is_user_defined": True,
+                    "key_env": "PRIVATE_PROVIDER_TOKEN",
+                    "models": ["private/chat-model"],
+                    "name": "Private provider",
+                    "slug": "custom:private",
+                    "source": "profile-config",
+                    "total_models": 1,
+                    "warning": "credential secret-warning",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(inventory, "build_models_payload", build_payload)
+    transport = _PrincipalTransport("alice")
+    public = _handle_with_transport(
+        server,
+        transport,
+        {"id": "models", "method": "model.options", "params": {}},
+    )
+
+    assert public["result"] == {
+        "model": "private/chat-model",
+        "provider": "custom:private",
+        "providers": [
+            {
+                "capabilities": {
+                    "private/chat-model": {"fast": False, "reasoning": True}
+                },
+                "is_current": True,
+                "is_user_defined": True,
+                "models": ["private/chat-model"],
+                "name": "Private provider",
+                "slug": "custom:private",
+                "total_models": 1,
+            }
+        ],
+    }
+    serialized = json.dumps(public, sort_keys=True)
+    for secret in (
+        secret_endpoint,
+        "catalog-secret",
+        "header-secret",
+        "PRIVATE_PROVIDER_TOKEN",
+        "secret-warning",
+        "profile-config",
+    ):
+        assert secret not in serialized
+    assert calls[-1]["pricing"] is False
+    assert calls[-1]["refresh"] is False
+    assert calls[-1]["probe_custom_providers"] is False
+    assert calls[-1]["probe_current_custom_provider"] is False
+
+    denied_refresh = _handle_with_transport(
+        server,
+        transport,
+        {
+            "id": "refresh",
+            "method": "model.options",
+            "params": {"refresh": True},
+        },
+    )
+    assert denied_refresh["error"] == {
+        "code": 4033,
+        "message": "public model.options does not permit provider refresh or probing",
+    }
+    assert len(calls) == 1
+
+    operator = _handle_with_transport(
+        server,
+        types.SimpleNamespace(
+            authenticated_principal=("dashboard-token", "local"),
+            authorized_profile="default",
+            allow_profile_override=True,
+        ),
+        {
+            "id": "operator-refresh",
+            "method": "model.options",
+            "params": {"refresh": True},
+        },
+    )
+    assert operator["result"]["providers"][0]["api_url"] == secret_endpoint
+    assert calls[-1]["pricing"] is True
+    assert calls[-1]["refresh"] is True
+    assert calls[-1]["probe_custom_providers"] is True
+    assert calls[-1]["probe_current_custom_provider"] is False
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        types.SimpleNamespace(
+            authenticated_principal=("dashboard-token", "local"),
+            allow_profile_override=True,
+        ),
+        types.SimpleNamespace(
+            authenticated_principal=("internal", "server"),
+            allow_profile_override=True,
+        ),
+        None,
+    ],
+    ids=("dashboard-token", "internal", "stdio"),
+)
+def test_session_active_list_operator_enumerates_all_live_sessions(
+    server, monkeypatch, transport
+):
+    alice = _owned_live_session(server, "alice")
+    alice["session_key"] = "alice-key"
+    bob = _owned_live_session(server, "bob")
+    bob["session_key"] = "bob-key"
+    local = _owned_live_session(server, "alice")
+    local["session_key"] = "local-key"
+    local["authenticated_principal"] = None
+    finalized = _owned_live_session(server, "alice")
+    finalized["session_key"] = "dead-key"
+    finalized["_finalized"] = True
+    server._sessions.update(
+        {"alice": alice, "bob": bob, "local": local, "dead": finalized}
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "current_transport", lambda: transport)
+
+    response = server.handle_request(
+        {"id": "active-operator", "method": "session.active_list", "params": {}}
+    )
+
+    assert [row["id"] for row in response["result"]["sessions"]] == [
+        "alice",
+        "bob",
+        "local",
+    ]
+
+
+def test_live_session_reattach_rejects_other_principal_and_accepts_owner(
+    server, monkeypatch
+):
+    sid = "owned01"
+    session = _owned_live_session(server, "alice")
+    original_transport = session["transport"]
+    server._sessions[sid] = session
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _NoRowsDB())
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session=None: {"model": "test/model"},
+    )
+    monkeypatch.setattr(server, "current_transport", lambda: _PrincipalTransport("bob"))
+    denied = server.handle_request(
+        {"id": "deny", "method": "session.activate", "params": {"session_id": sid}}
+    )
+
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "session belongs to a different authenticated principal",
+    }
+    assert session["transport"] is original_transport
+
+    owner_transport = _PrincipalTransport("alice")
+    monkeypatch.setattr(server, "current_transport", lambda: owner_transport)
+    allowed = server.handle_request(
+        {"id": "allow", "method": "session.activate", "params": {"session_id": sid}}
+    )
+
+    assert allowed["result"]["session_id"] == sid
+    assert session["transport"] is owner_transport
+
+
+@pytest.mark.parametrize(
+    ("principal", "allow_profile_override"),
+    [
+        (("dashboard-token", "local-session"), True),
+        (("stub", "server-operator"), True),
+        (None, False),
+    ],
+    ids=("dashboard-token", "server-internal", "stdio"),
+)
+def test_live_session_public_denial_preserves_local_operator_override(
+    server, monkeypatch, principal, allow_profile_override
+):
+    """Public tickets stay owner-bound; trusted local transports stay operators."""
+    sid = "operator01"
+    session = _owned_live_session(server, "alice")
+    original_transport = session["transport"]
+    server._sessions[sid] = session
+
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("principal mismatch/override must stop before DB access"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session=None: {"model": "test/model"},
+    )
+
+    monkeypatch.setattr(server, "current_transport", lambda: _PrincipalTransport("bob"))
+    denied = server.handle_request(
+        {"id": "deny", "method": "session.activate", "params": {"session_id": sid}}
+    )
+
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "session belongs to a different authenticated principal",
+    }
+    assert session["transport"] is original_transport
+
+    class _OperatorTransport:
+        def __init__(self):
+            self.authenticated_principal = principal
+            self.allow_profile_override = allow_profile_override
+
+        def write(self, _obj):
+            return True
+
+    operator = None if principal is None else _OperatorTransport()
+    monkeypatch.setattr(server, "current_transport", lambda: operator)
+    allowed = server.handle_request(
+        {"id": "allow", "method": "session.activate", "params": {"session_id": sid}}
+    )
+
+    assert allowed["result"]["session_id"] == sid
+    assert session["transport"] is (operator or server._stdio_transport)
+
+
+def test_live_session_resume_rejects_other_principal_and_accepts_owner(
+    server, monkeypatch
+):
+    sid = "owned02"
+    session = _owned_live_session(server, "alice")
+    original_transport = session["transport"]
+    server._sessions[sid] = session
+
+    class _DB:
+        def get_session(self, _target, authenticated_owner=None):
+            if authenticated_owner != ("stub", "alice"):
+                return None
+            return {"id": session["session_key"]}
+
+        def get_session_by_title(self, _target, authenticated_owner=None):
+            return None
+
+        def resolve_resume_session_id(self, target):
+            return target
+
+        def session_exists(self, _target):
+            return True
+
+        def session_owned_by(self, _target, owner):
+            return owner == ("stub", "alice")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session=None: {"model": "test/model"},
+    )
+    monkeypatch.setattr(server, "current_transport", lambda: _PrincipalTransport("bob"))
+    denied = server.handle_request(
+        {
+            "id": "deny",
+            "method": "session.resume",
+            "params": {"session_id": session["session_key"]},
+        }
+    )
+
+    assert denied["error"]["code"] == 4033
+    assert session["transport"] is original_transport
+
+    owner_transport = _PrincipalTransport("alice")
+    monkeypatch.setattr(server, "current_transport", lambda: owner_transport)
+    allowed = server.handle_request(
+        {
+            "id": "allow",
+            "method": "session.resume",
+            "params": {"session_id": session["session_key"]},
+        }
+    )
+
+    assert allowed["result"]["session_id"] == sid
+    assert session["transport"] is owner_transport
+
+
+def test_live_session_submit_rejects_other_principal_and_accepts_owner(
+    server, monkeypatch
+):
+    sid = "owned03"
+    session = _owned_live_session(server, "alice", running=True)
+    original_transport = session["transport"]
+    server._sessions[sid] = session
+
+    monkeypatch.setattr(server, "current_transport", lambda: _PrincipalTransport("bob"))
+    denied = server.handle_request(
+        {
+            "id": "deny",
+            "method": "prompt.submit",
+            "params": {"session_id": sid, "text": "steal it"},
+        }
+    )
+
+    assert denied["error"]["code"] == 4033
+    assert session["transport"] is original_transport
+    assert not session.get("queued_prompt")
+
+    owner_transport = _PrincipalTransport("alice")
+    monkeypatch.setattr(server, "current_transport", lambda: owner_transport)
+    allowed = server.handle_request(
+        {
+            "id": "allow",
+            "method": "prompt.submit",
+            "params": {"session_id": sid, "text": "next turn"},
+        }
+    )
+
+    assert allowed["result"]["status"] == "queued"
+    assert session["queued_prompt"]["text"] == "next turn"
+    assert session["transport"] is owner_transport
+
+
+def test_live_session_branch_rejects_other_principal_before_parent_access(
+    server, monkeypatch
+):
+    sid = "owned04"
+    session = _owned_live_session(server, "alice")
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "current_transport", lambda: _PrincipalTransport("bob"))
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("cross-principal branch must stop before DB access"),
+    )
+
+    denied = server.handle_request(
+        {"id": "deny", "method": "session.branch", "params": {"session_id": sid}}
+    )
+
+    assert denied["error"] == {
+        "code": 4033,
+        "message": "session belongs to a different authenticated principal",
+    }
+
+
 def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     """TUI /branch must persist a _branched_from marker so the branch stays
     visible in /resume and /sessions.
@@ -1120,12 +3147,19 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     thing that keeps a TUI branch visible.
     """
     create_calls = []
+    init_calls = []
 
     class _DB:
-        def get_session_title(self, _key):
+        def session_exists(self, _key):
+            return True
+
+        def session_owned_by(self, _key, owner):
+            return owner == ("stub", "alice")
+
+        def get_session_title(self, _key, **_kwargs):
             return "parent-title"
 
-        def get_next_title_in_lineage(self, base):
+        def get_next_title_in_lineage(self, base, **_kwargs):
             return f"{base} 2"
 
         def create_session(self, new_key, **kwargs):
@@ -1135,7 +3169,7 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
         def append_message(self, **_kwargs):
             return None
 
-        def set_session_title(self, _key, _title):
+        def set_session_title(self, _key, _title, **_kwargs):
             return None
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -1148,18 +3182,28 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
             model="test/model", session_id=session_id or key
         ),
     )
-    monkeypatch.setattr(server, "_init_session", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server,
+        "_init_session",
+        lambda *_args, **kwargs: init_calls.append(kwargs),
+    )
     monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_k: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_session_cwd", lambda _s: "/tmp/branch-cwd")
 
     parent_sid = "parent01"
     parent_key = "20260101_000000_parent"
+    owner_transport = _PrincipalTransport("alice")
+    monkeypatch.setattr(server, "current_transport", lambda: owner_transport)
     server._sessions[parent_sid] = {
+        "authenticated_principal": ("stub", "alice"),
         "session_key": parent_key,
         "history": [{"role": "user", "content": "hello"}],
         "history_lock": threading.Lock(),
         "cols": 80,
+        "profile": "default",
+        "profile_home": None,
+        "transport": owner_transport,
     }
 
     resp = server.handle_request(
@@ -1171,8 +3215,12 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     new_key, kwargs = create_calls[0]
     assert new_key == "20260101_000001_child0"
     assert kwargs["parent_session_id"] == parent_key
+    assert kwargs["authenticated_owner"] == ("stub", "alice")
     # The marker — without it the branch is invisible in /resume and /sessions.
     assert kwargs["model_config"] == {"_branched_from": parent_key}
+    assert init_calls[0]["authenticated_principal"] == ("stub", "alice")
+    assert init_calls[0]["profile"] == "default"
+    assert init_calls[0]["transport"] is owner_transport
 
 
 def test_make_agent_accepts_list_system_prompt(server, monkeypatch):

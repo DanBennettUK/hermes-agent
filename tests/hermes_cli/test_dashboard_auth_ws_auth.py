@@ -13,6 +13,10 @@ pre-existing regression unrelated to dashboard-auth.
 
 from __future__ import annotations
 
+import json
+import queue
+import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -221,13 +225,754 @@ class TestWsAuthOkLoopback:
         assert web_server._ws_auth_ok(ws) is False
 
 
-class TestWsAuthOkGated:
-    """Gate ON — ticket path only."""
+class TestWsAuthOkGatedTicketBasics:
+    """Gate ON — successful ticket authentication."""
 
     def test_valid_ticket_accepted(self, gated_app):
         ticket = mint_ticket(user_id="u1", provider="stub")
         ws = _fake_ws(query={"ticket": ticket})
         assert web_server._ws_auth_ok(ws) is True
+
+    def test_valid_ticket_propagates_verified_principal(self, gated_app):
+        ticket = mint_ticket(user_id="user-61507", provider="stub")
+        ws = _fake_ws(query={"ticket": ticket})
+
+        auth = web_server._ws_auth_context(ws)
+
+        assert auth.reason is None
+        assert auth.authenticated_principal == ("stub", "user-61507")
+
+
+def test_public_oauth_computer_use_status_rejects_foreign_profile_before_io(
+    gated_app, monkeypatch
+):
+    """A public profile claim cannot select another profile's bridge secret."""
+    _logged_in(gated_app)
+    monkeypatch.setattr(web_server, "_dashboard_launch_profile", lambda: "default")
+
+    entered_scopes = []
+    config_reads = []
+    bridge_requests = []
+
+    @contextmanager
+    def tracked_scope(profile):
+        entered_scopes.append(profile)
+        yield
+
+    def configured_backend():
+        config_reads.append(True)
+        return "bridge"
+
+    def bridge_status():
+        bridge_requests.append(True)
+        return {"ready": True}
+
+    monkeypatch.setattr(web_server, "_config_profile_scope", tracked_scope)
+    monkeypatch.setattr(
+        "tools.computer_use.tool.configured_computer_use_backend",
+        configured_backend,
+    )
+    monkeypatch.setattr(
+        "tools.computer_use.bridge.bridge_computer_use_status", bridge_status
+    )
+
+    response = gated_app.get("/api/tools/computer-use/status?profile=work")
+
+    assert response.status_code == 403
+    assert entered_scopes == []
+    assert config_reads == []
+    assert bridge_requests == []
+
+
+def test_public_oauth_computer_use_status_allows_launch_profile(gated_app, monkeypatch):
+    _logged_in(gated_app)
+    monkeypatch.setattr(web_server, "_dashboard_launch_profile", lambda: "default")
+
+    entered_scopes = []
+    bridge_requests = []
+
+    @contextmanager
+    def tracked_scope(profile):
+        entered_scopes.append(profile)
+        yield
+
+    def bridge_status():
+        bridge_requests.append(True)
+        return {"ready": True, "checks": [{"label": "launch-profile"}]}
+
+    monkeypatch.setattr(web_server, "_config_profile_scope", tracked_scope)
+    monkeypatch.setattr(
+        "tools.computer_use.tool.configured_computer_use_backend",
+        lambda: "bridge",
+    )
+    monkeypatch.setattr(
+        "tools.computer_use.bridge.bridge_computer_use_status", bridge_status
+    )
+
+    response = gated_app.get("/api/tools/computer-use/status?profile=Default")
+
+    assert response.status_code == 200
+    assert response.json()["checks"] == [{"label": "launch-profile"}]
+    assert entered_scopes == [None]
+    assert bridge_requests == [True]
+
+
+def test_operator_computer_use_status_keeps_cross_profile_compatibility(
+    loopback_app, monkeypatch
+):
+    entered_scopes = []
+    bridge_requests = []
+
+    @contextmanager
+    def tracked_scope(profile):
+        entered_scopes.append(profile)
+        yield
+
+    def bridge_status():
+        bridge_requests.append(True)
+        return {"ready": True, "checks": [{"label": "operator-profile"}]}
+
+    monkeypatch.setattr(web_server, "_config_profile_scope", tracked_scope)
+    monkeypatch.setattr(
+        "tools.computer_use.tool.configured_computer_use_backend",
+        lambda: "bridge",
+    )
+    monkeypatch.setattr(
+        "tools.computer_use.bridge.bridge_computer_use_status", bridge_status
+    )
+
+    response = loopback_app.get(
+        "/api/tools/computer-use/status?profile=work",
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["checks"] == [{"label": "operator-profile"}]
+    assert entered_scopes == ["work"]
+    assert bridge_requests == [True]
+
+
+def test_public_oauth_computer_use_grant_rejects_foreign_profile_before_platform_or_spawn(
+    gated_app, monkeypatch
+):
+    _logged_in(gated_app)
+    monkeypatch.setattr(web_server, "_dashboard_launch_profile", lambda: "default")
+    monkeypatch.setattr(web_server.sys, "platform", "linux")
+
+    profile_lookups = []
+    spawned = []
+    monkeypatch.setattr(
+        web_server,
+        "_profile_cli_args",
+        lambda profile: profile_lookups.append(profile) or [],
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_spawn_hermes_action",
+        lambda *args: spawned.append(args),
+    )
+
+    response = gated_app.post(
+        "/api/tools/computer-use/permissions/grant?profile=work"
+    )
+
+    assert response.status_code == 403
+    assert profile_lookups == []
+    assert spawned == []
+
+
+def test_public_oauth_computer_use_grant_allows_launch_profile(
+    gated_app, monkeypatch
+):
+    _logged_in(gated_app)
+    monkeypatch.setattr(web_server, "_dashboard_launch_profile", lambda: "default")
+    monkeypatch.setattr(web_server.sys, "platform", "darwin")
+
+    profile_args = []
+    spawned = []
+
+    def tracked_profile_args(profile):
+        profile_args.append(profile)
+        return []
+
+    def fake_spawn(argv, name):
+        spawned.append((argv, name))
+        return SimpleNamespace(pid=61507)
+
+    monkeypatch.setattr(web_server, "_profile_cli_args", tracked_profile_args)
+    monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
+
+    response = gated_app.post(
+        "/api/tools/computer-use/permissions/grant?profile=Default"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "pid": 61507,
+        "name": "computer-use-grant",
+    }
+    assert profile_args == [None]
+    assert spawned == [
+        (["computer-use", "permissions", "grant"], "computer-use-grant")
+    ]
+
+
+def test_operator_computer_use_grant_keeps_cross_profile_compatibility(
+    loopback_app, monkeypatch
+):
+    monkeypatch.setattr(web_server.sys, "platform", "darwin")
+
+    profile_args = []
+    spawned = []
+
+    def tracked_profile_args(profile):
+        profile_args.append(profile)
+        return ["-p", str(profile)]
+
+    def fake_spawn(argv, name):
+        spawned.append((argv, name))
+        return SimpleNamespace(pid=61508)
+
+    monkeypatch.setattr(web_server, "_profile_cli_args", tracked_profile_args)
+    monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
+
+    response = loopback_app.post(
+        "/api/tools/computer-use/permissions/grant?profile=work",
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert profile_args == ["work"]
+    assert spawned == [
+        (
+            ["-p", "work", "computer-use", "permissions", "grant"],
+            "computer-use-grant",
+        )
+    ]
+
+
+def test_public_bridge_foreign_profile_denial_does_not_probe_existence(
+    gated_app, monkeypatch
+):
+    """Existing and missing foreign profiles are indistinguishable publicly."""
+    from starlette.websockets import WebSocketDisconnect
+
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+    monkeypatch.setattr(web_server, "_dashboard_launch_profile", lambda: "default")
+
+    profile_probes = []
+
+    def distinguishing_probe(profile):
+        profile_probes.append(profile)
+        if profile == "missing-foreign":
+            raise RuntimeError("missing")
+        return profile
+
+    monkeypatch.setattr(web_server, "_resolve_profile_dir", distinguishing_probe)
+
+    close_codes = []
+    for profile in ("existing-foreign", "missing-foreign"):
+        ticket = mint_ticket(user_id="alice", provider="stub")
+        with pytest.raises(WebSocketDisconnect) as denied:
+            with gated_app.websocket_connect(
+                "/api/tools/computer-use/desktop-bridge/ws"
+                f"?ticket={ticket}&profile={profile}"
+            ) as ws:
+                ws.receive_json()
+        close_codes.append(denied.value.code)
+
+    assert close_codes == [4403, 4403]
+    assert profile_probes == []
+
+
+def test_operator_bridge_keeps_validated_cross_profile_scope(
+    loopback_app, monkeypatch
+):
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+
+    profile_probes = []
+    handled = []
+
+    def resolve_profile(profile):
+        profile_probes.append(profile)
+        return profile
+
+    async def fake_handle(ws, **scope):
+        handled.append(scope)
+        await ws.accept()
+        await ws.send_json({"ok": True})
+        await ws.close()
+
+    monkeypatch.setattr(web_server, "_resolve_profile_dir", resolve_profile)
+    monkeypatch.setattr(
+        "tools.computer_use.desktop_bridge.handle_desktop_bridge_ws", fake_handle
+    )
+
+    with loopback_app.websocket_connect(
+        "/api/tools/computer-use/desktop-bridge/ws"
+        f"?token={web_server._SESSION_TOKEN}&profile=Work"
+    ) as ws:
+        assert ws.receive_json() == {"ok": True}
+
+    assert profile_probes == ["work"]
+    assert handled == [
+        {
+            "provider": "dashboard-token",
+            "principal": "local-session",
+            "profile": "work",
+        }
+    ]
+
+
+def test_bridge_ticket_requires_matching_live_principal_profile_context(
+    gated_app, monkeypatch
+):
+    """A ticket alone cannot claim another principal's live profile scope."""
+    from starlette.websockets import WebSocketDisconnect
+    from tui_gateway import server as tui_server
+
+    sid = "alice-live"
+    tui_server._sessions[sid] = {
+        "authenticated_principal": ("stub", "alice"),
+        "profile": "default",
+        "profile_home": None,
+    }
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+    monkeypatch.setattr(web_server, "_dashboard_launch_profile", lambda: "default")
+    resolved_profiles = []
+    monkeypatch.setattr(
+        web_server,
+        "_resolve_profile_dir",
+        lambda name: resolved_profiles.append(name) or name,
+    )
+    handled = []
+
+    async def fake_handle(ws, **scope):
+        handled.append(scope)
+        await ws.accept()
+        await ws.send_json({"ok": True})
+        await ws.close()
+
+    monkeypatch.setattr(
+        "tools.computer_use.desktop_bridge.handle_desktop_bridge_ws", fake_handle
+    )
+
+    try:
+        cross_profile_ticket = mint_ticket(user_id="alice", provider="stub")
+        with pytest.raises(WebSocketDisconnect) as cross_profile:
+            with gated_app.websocket_connect(
+                "/api/tools/computer-use/desktop-bridge/ws"
+                f"?ticket={cross_profile_ticket}&profile=work"
+            ) as ws:
+                ws.receive_json()
+        assert cross_profile.value.code == 4403
+
+        bob_ticket = mint_ticket(user_id="bob", provider="stub")
+        with pytest.raises(WebSocketDisconnect) as denied:
+            with gated_app.websocket_connect(
+                "/api/tools/computer-use/desktop-bridge/ws"
+                f"?ticket={bob_ticket}&profile=default"
+            ) as ws:
+                ws.receive_json()
+        assert denied.value.code == 4403
+        assert handled == []
+        assert resolved_profiles == []
+
+        alice_ticket = mint_ticket(user_id="alice", provider="stub")
+        with gated_app.websocket_connect(
+            "/api/tools/computer-use/desktop-bridge/ws"
+            f"?ticket={alice_ticket}&profile=default"
+        ) as ws:
+            assert ws.receive_json() == {"ok": True}
+        assert handled == [
+            {"provider": "stub", "principal": "alice", "profile": "default"}
+        ]
+        assert resolved_profiles == ["default"]
+    finally:
+        tui_server._sessions.pop(sid, None)
+
+
+def test_ticket_principal_and_session_profile_reach_only_their_bridge(
+    gated_app, monkeypatch, tmp_path
+):
+    """Authenticated WS transport -> profile context -> real tool dispatch."""
+    from hermes_cli import profiles as profiles_mod
+    from tools.computer_use import tool as computer_use_tool
+    from tools.computer_use.desktop_bridge import _BROKER, DesktopBridgeScope
+    from tui_gateway import server as tui_server
+
+    profiles_root = tmp_path / "profiles"
+    default_home = tmp_path / "default"
+    default_home.mkdir()
+    (default_home / "config.yaml").write_text(
+        "computer_use:\n  backend: cua\n", encoding="utf-8"
+    )
+    profiles_root.mkdir()
+
+    monkeypatch.setattr(profiles_mod, "_get_default_hermes_home", lambda: default_home)
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(tui_server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.start_background_mcp_discovery",
+        lambda **_kwargs: None,
+    )
+    # Build only the test agent below. Session creation, WebSocket transport,
+    # profile binding, turn dispatch, backend lookup, and bridge I/O stay real.
+    monkeypatch.setattr(tui_server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(tui_server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(
+        tui_server,
+        "_claim_active_session_slot",
+        lambda *_args, **_kwargs: (None, None),
+    )
+    monkeypatch.setattr(tui_server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(tui_server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(
+        tui_server, "_sync_agent_model_with_config", lambda _sid, _session: None
+    )
+    monkeypatch.setattr(
+        tui_server,
+        "_sync_session_key_after_compress",
+        lambda *_args, **_kwargs: None,
+    )
+
+    class LocalFallback:
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def is_available(self):
+            return True
+
+        def list_apps(self):
+            return [{"name": "gateway-local"}]
+
+    monkeypatch.setattr(
+        "tools.computer_use.cua_backend.CuaDriverBackend", LocalFallback
+    )
+
+    results: queue.Queue[tuple[str, dict]] = queue.Queue()
+
+    class ToolDispatchAgent:
+        api_mode = ""
+        base_url = ""
+        model = "test-model"
+        provider = "test"
+
+        def __init__(self, owner, session_key):
+            self.owner = owner
+            self.session_id = session_key
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, _message, **_kwargs):
+            payload = json.loads(
+                computer_use_tool.handle_computer_use({"action": "list_apps"})
+            )
+            results.put((self.owner, payload))
+            return {"final_response": "tool complete", "messages": []}
+
+    def receive_response(ws, request_id):
+        while True:
+            frame = ws.receive_json()
+            if frame.get("id") == request_id:
+                return frame
+
+    def create_session(ws, owner):
+        request_id = f"create-{owner}"
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "session.create",
+                "params": {"source": "desktop"},
+            }
+        )
+        response = receive_response(ws, request_id)
+        sid = response["result"]["session_id"]
+        session = tui_server._sessions[sid]
+        session["agent"] = ToolDispatchAgent(owner, session["session_key"])
+        session["agent_ready"].set()
+        return sid
+
+    def submit_list_apps(ws, owner, sid):
+        request_id = f"prompt-{owner}"
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": "list apps"},
+            }
+        )
+        response = receive_response(ws, request_id)
+        assert response["result"]["status"] == "streaming"
+
+    def answer_bridge_list_apps(ws, owner):
+        status = ws.receive_json()
+        assert status["type"] == "status"
+        ws.send_json(
+            {"id": status["id"], "ok": True, "result": {"ready": True, "checks": []}}
+        )
+        call = ws.receive_json()
+        assert call["type"] == "computer-use"
+        assert call["method"] == "list_apps"
+        ws.send_json(
+            {
+                "id": call["id"],
+                "ok": True,
+                "result": {"apps": [{"name": f"{owner}-desktop"}]},
+            }
+        )
+
+    def wait_session_idle(sid):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if not tui_server._sessions[sid]["running"]:
+                return
+            time.sleep(0.01)
+        raise AssertionError(f"session {sid} did not become idle")
+
+    tui_server._sessions.clear()
+    computer_use_tool.reset_backend_for_tests()
+    alice_bridge_ticket = mint_ticket(user_id="alice", provider="stub")
+    bob_bridge_ticket = mint_ticket(user_id="bob", provider="stub")
+    alice_gateway_ticket = mint_ticket(user_id="alice", provider="stub")
+    bob_gateway_ticket = mint_ticket(user_id="bob", provider="stub")
+    mallory_gateway_ticket = mint_ticket(user_id="mallory", provider="stub")
+
+    try:
+        with gated_app.websocket_connect(
+            f"/api/ws?ticket={alice_gateway_ticket}"
+        ) as alice_gateway, gated_app.websocket_connect(
+            f"/api/ws?ticket={bob_gateway_ticket}"
+        ) as bob_gateway, gated_app.websocket_connect(
+            f"/api/ws?ticket={mallory_gateway_ticket}"
+        ) as mallory_gateway:
+            for gateway in (alice_gateway, bob_gateway, mallory_gateway):
+                assert gateway.receive_json()["params"]["type"] == "gateway.ready"
+
+            alice_sid = create_session(alice_gateway, "alice")
+            bob_sid = create_session(bob_gateway, "bob")
+            mallory_sid = create_session(mallory_gateway, "mallory")
+
+            # Public bridge registration happens only after the matching
+            # principal/profile session exists. The ticket cannot create that
+            # authority by carrying its own profile claim.
+            with gated_app.websocket_connect(
+                "/api/tools/computer-use/desktop-bridge/ws"
+                f"?ticket={alice_bridge_ticket}"
+            ) as alice_bridge, gated_app.websocket_connect(
+                "/api/tools/computer-use/desktop-bridge/ws"
+                f"?ticket={bob_bridge_ticket}"
+            ) as bob_bridge:
+                submit_list_apps(alice_gateway, "alice", alice_sid)
+                answer_bridge_list_apps(alice_bridge, "alice")
+                assert results.get(timeout=2) == (
+                    "alice",
+                    {"apps": [{"name": "alice-desktop"}], "count": 1},
+                )
+
+                submit_list_apps(bob_gateway, "bob", bob_sid)
+                answer_bridge_list_apps(bob_bridge, "bob")
+                assert results.get(timeout=2) == (
+                    "bob",
+                    {"apps": [{"name": "bob-desktop"}], "count": 1},
+                )
+
+                # A verified principal/profile with no matching connector keeps its
+                # own local CUA route even while Alice and Bob are connected.
+                submit_list_apps(mallory_gateway, "mallory", mallory_sid)
+                assert results.get(timeout=2) == (
+                    "mallory",
+                    {"apps": [{"name": "gateway-local"}], "count": 1},
+                )
+
+                alice_bridge.close()
+                alice_scope = DesktopBridgeScope("stub", "alice", "default")
+                deadline = time.monotonic() + 2
+                while _BROKER.is_connected(alice_scope) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert _BROKER.is_connected(alice_scope) is False
+                assert _BROKER.is_connected(
+                    DesktopBridgeScope("stub", "bob", "default")
+                ) is True
+
+                # Alice disconnecting/reconfiguring cannot tear down Bob's scope.
+                wait_session_idle(bob_sid)
+                submit_list_apps(bob_gateway, "bob-again", bob_sid)
+                answer_bridge_list_apps(bob_bridge, "bob")
+                assert results.get(timeout=2) == (
+                    "bob",
+                    {"apps": [{"name": "bob-desktop"}], "count": 1},
+                )
+    finally:
+        computer_use_tool.reset_backend_for_tests()
+        for sid in list(tui_server._sessions):
+            tui_server._close_session_by_id(sid, end_reason="test_cleanup")
+
+
+def test_public_oauth_gateway_cwd_boundary_uses_only_owned_session_workspace(
+    gated_app, monkeypatch, tmp_path
+):
+    """Exercise CWD denials through a real ticket-authenticated /api/ws."""
+    from hermes_cli import profiles as profiles_mod
+    from tui_gateway import server as tui_server
+
+    owned = tmp_path / "owned"
+    foreign = tmp_path / "foreign"
+    owned.mkdir()
+    foreign.mkdir()
+    (owned / "owned.txt").write_text("owned", encoding="utf-8")
+    (foreign / "foreign-secret.txt").write_text("secret", encoding="utf-8")
+
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+    monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(tui_server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.start_background_mcp_discovery",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(tui_server, "_load_cfg", lambda: {"terminal": {"cwd": str(owned)}})
+    monkeypatch.setattr(tui_server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(tui_server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(
+        tui_server,
+        "_claim_active_session_slot",
+        lambda *_args, **_kwargs: (None, None),
+    )
+
+    class _NoRowsDB:
+        def session_exists(self, _target):
+            return False
+
+    monkeypatch.setattr(tui_server, "_get_db", lambda: _NoRowsDB())
+
+    branch_probes = []
+    original_isdir = tui_server.os.path.isdir
+    existence_probes = []
+
+    def branch_for_cwd(cwd):
+        branch_probes.append(cwd)
+        return "owned-branch" if cwd == str(owned) else "foreign-branch"
+
+    def tracked_isdir(path):
+        existence_probes.append(str(path))
+        return original_isdir(path)
+
+    monkeypatch.setattr(tui_server, "_git_branch_for_cwd", branch_for_cwd)
+    monkeypatch.setattr(tui_server.os.path, "isdir", tracked_isdir)
+
+    def receive_response(ws, request_id):
+        while True:
+            frame = ws.receive_json()
+            if frame.get("id") == request_id:
+                return frame
+
+    def rpc(ws, request_id, method, params):
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }
+        )
+        return receive_response(ws, request_id)
+
+    tui_server._sessions.clear()
+    ticket = mint_ticket(user_id="alice", provider="stub")
+    try:
+        with gated_app.websocket_connect(f"/api/ws?ticket={ticket}") as gateway:
+            assert gateway.receive_json()["params"]["type"] == "gateway.ready"
+
+            created = rpc(
+                gateway,
+                "create",
+                "session.create",
+                {"source": "desktop"},
+            )
+            sid = created["result"]["session_id"]
+            assert tui_server._sessions[sid]["cwd"] == str(owned)
+
+            denied_requests = (
+                (
+                    "create-foreign",
+                    "session.create",
+                    {"cwd": str(foreign), "source": "desktop"},
+                ),
+                (
+                    "resume-foreign",
+                    "session.resume",
+                    {"cwd": str(foreign), "session_id": "invented"},
+                ),
+                (
+                    "project-foreign",
+                    "config.get",
+                    {"cwd": str(foreign), "key": "project", "session_id": sid},
+                ),
+                (
+                    "set-foreign",
+                    "session.cwd.set",
+                    {"cwd": str(foreign), "session_id": sid},
+                ),
+                (
+                    "complete-foreign",
+                    "complete.path",
+                    {"cwd": str(foreign), "session_id": sid, "word": "@file:"},
+                ),
+                (
+                    "preview-foreign",
+                    "preview.restart",
+                    {
+                        "cwd": str(foreign),
+                        "session_id": sid,
+                        "url": "http://127.0.0.1:5173",
+                    },
+                ),
+            )
+            for request_id, method, params in denied_requests:
+                denied = rpc(gateway, request_id, method, params)
+                assert denied["error"]["code"] == 4033
+                assert "cwd" in denied["error"]["message"]
+
+            project = rpc(
+                gateway,
+                "project-owned",
+                "config.get",
+                {"key": "project", "session_id": sid},
+            )
+            assert project["result"] == {
+                "branch": "owned-branch",
+                "cwd": str(owned),
+            }
+
+            completion = rpc(
+                gateway,
+                "complete-owned",
+                "complete.path",
+                {"cwd": str(owned), "session_id": sid, "word": "@file:"},
+            )
+            serialized = json.dumps(completion, sort_keys=True)
+            assert "owned.txt" in serialized
+            assert "foreign-secret.txt" not in serialized
+
+        assert str(foreign) not in existence_probes
+        assert str(foreign) not in branch_probes
+        assert tui_server._sessions[sid]["cwd"] == str(owned)
+    finally:
+        for sid in list(tui_server._sessions):
+            tui_server._close_session_by_id(sid, end_reason="test_cleanup")
+
+
+class TestWsAuthOkGatedCredentialRules:
+    """Gate ON — rejection, replay, and internal-credential rules."""
 
     def test_consumed_ticket_rejected(self, gated_app):
         ticket = mint_ticket(user_id="u1", provider="stub")

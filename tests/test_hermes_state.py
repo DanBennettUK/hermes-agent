@@ -2791,6 +2791,12 @@ class TestSchemaInit:
         columns = {row[1] for row in cursor.fetchall()}
         assert "title" in columns
 
+    def test_persisted_owner_columns_exist(self, db):
+        """Authenticated session ownership is durable SQLite schema state."""
+        cursor = db._conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        assert {"owner_provider", "owner_principal"} <= columns
+
     def test_topic_mode_schema_is_not_auto_migrated_on_open(self, tmp_path):
         """Opening an old DB should not add topic-mode columns until /topic opts in.
 
@@ -2859,6 +2865,7 @@ class TestSchemaInit:
         db = SessionDB(db_path=old_db)
         cursor = db._conn.execute("PRAGMA table_info(sessions)")
         columns = {row[1] for row in cursor.fetchall()}
+        assert {"owner_provider", "owner_principal"} <= columns
         assert {"telegram_dm_topic_mode", "telegram_topic_thread_id"}.isdisjoint(columns)
         db.close()
 

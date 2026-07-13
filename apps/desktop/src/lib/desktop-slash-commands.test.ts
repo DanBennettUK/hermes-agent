@@ -40,14 +40,18 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
   })
 
-  it('surfaces /tools, /save, and /personality on the desktop', () => {
-    expect(isDesktopSlashSuggestion('/tools')).toBe(true)
+  it('keeps operator commands available for the server-verified legacy fallback', () => {
+    for (const command of ['/tools', '/debug', '/rollback', '/stop']) {
+      expect(isDesktopSlashSuggestion(command)).toBe(true)
+      expect(isDesktopSlashCommand(command)).toBe(true)
+      expect(resolveDesktopCommand(command)?.surface).toEqual({ kind: 'exec' })
+      expect(desktopSlashUnavailableMessage(command)).toBeNull()
+    }
+
     expect(isDesktopSlashSuggestion('/save')).toBe(true)
     expect(isDesktopSlashSuggestion('/personality')).toBe(true)
-    expect(isDesktopSlashCommand('/tools')).toBe(true)
     expect(isDesktopSlashCommand('/save')).toBe(true)
     expect(isDesktopSlashCommand('/personality')).toBe(true)
-    expect(desktopSlashUnavailableMessage('/tools')).toBeNull()
     expect(desktopSlashUnavailableMessage('/save')).toBeNull()
     expect(desktopSlashUnavailableMessage('/personality')).toBeNull()
   })

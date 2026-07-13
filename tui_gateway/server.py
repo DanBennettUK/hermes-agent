@@ -180,6 +180,7 @@ _LONG_HANDLERS = frozenset(
         "billing.step_up",
         "browser.manage",
         "cli.exec",
+        "desktop.command",
         # Completion RPCs run inline on the reader thread by default, but both
         # can block it for seconds: complete.path spawns `git ls-files` and
         # fuzzy-ranks the whole repo (slow on large repos / WSL2 mounts), and
@@ -628,8 +629,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     _tui_owns_lifecycle = True
     if session_id:
         try:
-            db = _get_db()
-            if db is not None:
+            with _session_db(session) as db:
+                if db is None:
+                    raise RuntimeError("session db unavailable")
                 # Don't end gateway-originated sessions — the gateway owns
                 # their lifecycle.  The TUI is a viewer, not the owner.
                 # Ending a gateway session in state.db triggers a Groundhog
@@ -1020,8 +1022,273 @@ def _profile_home(profile: str | None) -> Path | None:
     return home if (home / "state.db").exists() or home.exists() else None
 
 
+def _normalized_authenticated_principal(value: Any) -> tuple[str, str] | None:
+    """Normalize only a principal supplied by a trusted transport/session."""
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    provider, subject = (str(part).strip() for part in value)
+    return (provider, subject) if provider and subject else None
+
+
+def _transport_authenticated_principal(
+    transport: Transport | None = None,
+) -> tuple[str, str] | None:
+    transport = transport if transport is not None else current_transport()
+    return _normalized_authenticated_principal(
+        getattr(transport, "authenticated_principal", None)
+    )
+
+
+def _public_authenticated_owner(
+    transport: Transport | None = None,
+) -> tuple[str, str] | None:
+    """Return the owner enforced for a public authenticated transport.
+
+    Dashboard-token/internal transports intentionally retain local operator
+    compatibility, including cross-profile and legacy-session access. Public
+    tickets have a verified principal but no such override authority, so every
+    persisted-session query must bind to their canonical owner pair.
+    """
+    transport = transport if transport is not None else current_transport()
+    principal = _transport_authenticated_principal(transport)
+    if principal is None or bool(getattr(transport, "allow_profile_override", False)):
+        return None
+    return principal
+
+
+def _public_authorized_profile(
+    transport: Transport | None = None,
+) -> str | None:
+    """Return the normalized profile enforced for a public transport."""
+    transport = transport if transport is not None else current_transport()
+    if _public_authenticated_owner(transport) is None:
+        return None
+    raw = str(getattr(transport, "authorized_profile", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        profile = profiles_mod.normalize_profile_name(raw)
+        profiles_mod.validate_profile_name(profile)
+        return profile
+    except Exception:
+        # The central public policy rejects this transport before handlers run.
+        # Keep direct/internal handler calls fail-closed as well.
+        return None
+
+
+def _transport_allows_profile_override(
+    transport: Transport | None = None,
+) -> bool:
+    """Whether this request represents a trusted local/operator transport."""
+    transport = transport if transport is not None else current_transport()
+    # Direct/stdio dispatch is the original local operator surface. WebSocket
+    # transports must be explicitly marked by the authentication boundary.
+    return transport is None or transport is _stdio_transport or bool(
+        getattr(transport, "allow_profile_override", False)
+    )
+
+
+def _stored_owner_kwargs() -> dict[str, tuple[str, str]]:
+    owner = _public_authenticated_owner()
+    return {"authenticated_owner": owner} if owner is not None else {}
+
+
+def _stored_session_access_error(db, session_id: str, rid: Any) -> dict | None:
+    """Authorize a stored row before resolving any of its user data."""
+    owner = _public_authenticated_owner()
+    if owner is None:
+        return None
+    try:
+        allowed = bool(db.session_owned_by(session_id, owner))
+    except Exception:
+        logger.exception("persisted session ownership check failed")
+        return _err(rid, 4033, "could not verify persisted session ownership")
+    if allowed:
+        return None
+    return _err(
+        rid,
+        4033,
+        "session is unowned or belongs to a different authenticated principal",
+    )
+
+
+def _session_authenticated_principal(session: dict) -> tuple[str, str] | None:
+    return _normalized_authenticated_principal(
+        session.get("authenticated_principal")
+    )
+
+
+def _session_owner_kwargs(session: dict) -> dict[str, tuple[str, str]]:
+    """Bind background/live DB work to the session's server-stamped owner."""
+    session_transport = session.get("transport")
+    if session_transport is _stdio_transport or bool(
+        getattr(session_transport, "allow_profile_override", False)
+    ):
+        # Local/operator sessions retain legacy-row and cross-owner access.
+        return {}
+    owner = _session_authenticated_principal(session)
+    return {"authenticated_owner": owner} if owner is not None else {}
+
+
+def _session_profile_name(session: dict) -> str:
+    """Return the canonical server-owned profile bound to a live session."""
+    raw = str(session.get("profile") or "").strip()
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        if raw:
+            return profiles_mod.normalize_profile_name(raw)
+        profile_home = str(session.get("profile_home") or "").strip()
+        if profile_home:
+            return profiles_mod.normalize_profile_name(Path(profile_home).name)
+    except Exception:
+        pass
+    return _current_profile_name()
+
+
+def _session_principal_error(session: dict, rid: Any) -> dict | None:
+    """Fail closed when a public RPC transport does not own a live session."""
+    public_owner = _public_authenticated_owner()
+    if public_owner is None:
+        # Stdio, dashboard-token, and server-internal transports represent the
+        # local operator and intentionally retain cross-session/profile access.
+        return None
+
+    expected = _session_authenticated_principal(session)
+    if expected != public_owner:
+        return _err(
+            rid,
+            4033,
+            "session belongs to a different authenticated principal",
+        )
+
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        return None
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return _err(rid, 4033, "could not verify persisted session ownership")
+            # Brand-new drafts intentionally have no row until first activity.
+            # Once a row exists, every public live-session RPC must agree with
+            # its durable owner before touching title/history/mutable state.
+            if not db.session_exists(session_key):
+                return None
+            if db.session_owned_by(session_key, public_owner):
+                return None
+    except Exception:
+        logger.exception("live persisted session ownership check failed")
+    return _err(
+        rid,
+        4033,
+        "session is unowned or belongs to a different authenticated principal",
+    )
+
+
+def _resolve_session_profile_scope(
+    requested_profile: str | None,
+) -> tuple[str, Path | None]:
+    """Resolve and authorize a session profile at the RPC trust boundary.
+
+    Public WS tickets are pinned by ``hermes_cli.web_server`` to the profile
+    served by this backend.  Local stdio, dashboard-token, and server-internal
+    transports preserve the established multi-profile behavior.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    current = _current_profile_name()
+    requested = str(requested_profile or "").strip()
+    if not requested or requested.lower() == "current":
+        profile = current
+    else:
+        profile = profiles_mod.normalize_profile_name(requested)
+        profiles_mod.validate_profile_name(profile)
+
+    transport = current_transport()
+    principal = _transport_authenticated_principal(transport)
+    if principal is not None and not bool(
+        getattr(transport, "allow_profile_override", False)
+    ):
+        authorized = str(getattr(transport, "authorized_profile", "") or "").strip()
+        if not authorized:
+            raise PermissionError("authenticated transport has no authorized profile")
+        authorized = profiles_mod.normalize_profile_name(authorized)
+        if profile != authorized:
+            raise PermissionError(
+                "requested profile is not authorized for this authenticated transport"
+            )
+
+    if profile == current:
+        return profile, None
+    if not profiles_mod.profile_exists(profile):
+        raise ValueError(f"profile '{profile}' does not exist")
+    home = Path(profiles_mod.get_profile_dir(profile)).expanduser().resolve(strict=True)
+    return profile, home
+
+
+def principal_has_live_profile_session(
+    principal: tuple[str, str], profile: str
+) -> bool:
+    """Whether verified server state binds ``principal`` to a live profile."""
+    normalized_principal = _normalized_authenticated_principal(principal)
+    if normalized_principal is None:
+        return False
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        normalized_profile = profiles_mod.normalize_profile_name(profile)
+    except Exception:
+        return False
+    with _sessions_lock:
+        return any(
+            not session.get("_finalized")
+            and _session_authenticated_principal(session) == normalized_principal
+            and _session_profile_name(session) == normalized_profile
+            for session in _sessions.values()
+        )
+
+
+def _validated_session_profile_home(session: dict) -> Path | None:
+    """Return a session's trusted named-profile home, or fail closed.
+
+    ``profile_home`` is server-owned session state, never an RPC identity field.
+    Still validate it before carrying it into a branch: stale/corrupt state must
+    not silently fall back to the launch profile and route tools to that scope.
+    """
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        session_profile = profiles_mod.normalize_profile_name(
+            str(session.get("profile") or _session_profile_name(session))
+        )
+        profiles_mod.validate_profile_name(session_profile)
+    except Exception as exc:
+        raise ValueError("parent session profile scope is no longer valid") from exc
+    raw = session.get("profile_home")
+    if not raw:
+        # A launch-profile session legitimately has no override. Any other
+        # canonical profile without its corresponding home would make branch
+        # persistence fall through to the launch DB, so reject corrupted or
+        # legacy-mixed state instead of changing scope.
+        if session_profile != _current_profile_name():
+            raise ValueError("parent session profile scope is no longer valid")
+        return None
+    try:
+        candidate = Path(raw).expanduser().resolve(strict=True)
+        expected = Path(profiles_mod.get_profile_dir(session_profile)).resolve(
+            strict=True
+        )
+    except Exception as exc:
+        raise ValueError("parent session profile scope is no longer valid") from exc
+    if candidate != expected:
+        raise ValueError("parent session profile scope is no longer valid")
+    return candidate
+
+
 def _profile_scoped(handler):
-    """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
+    """Authorize and bind a pet RPC's profile at the transport boundary.
 
     Pets are per-profile: ``display.pet.*`` lives in the profile's config.yaml and
     sprites install under its ``pets/`` dir (both resolve via ``get_hermes_home``).
@@ -1031,7 +1298,14 @@ def _profile_scoped(handler):
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        try:
+            _profile, home = _resolve_session_profile_scope(
+                params.get("profile") if isinstance(params, dict) else None
+            )
+        except PermissionError as exc:
+            return _err(rid, 4033, str(exc))
+        except (OSError, ValueError) as exc:
+            return _err(rid, 4004, str(exc))
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -1239,6 +1513,319 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     return rid, method, params
 
 
+# Public OAuth tickets authenticate an end user, not a dashboard operator.  Keep
+# this list deliberately small and declarative: every newly registered RPC is
+# operator-only until it is reviewed and placed in one of the public classes
+# below.  In particular, do not infer safety from a supplied ``session_id`` --
+# live-session methods are authorized against the server-owned session record.
+_PUBLIC_READ_ONLY_METHODS = frozenset(
+    {
+        # Desktop connection/readiness and picker metadata.
+        "commands.catalog",
+        "complete.slash",
+        "setup.runtime_check",
+        "setup.status",
+        # Owner- and authorized-profile-filtered session display.
+        "session.active_list",
+        "session.list",
+        "session.most_recent",
+    }
+)
+
+# Public model discovery is useful before a session exists.  Once a caller
+# supplies a session id, however, the handler layers that live agent's model,
+# provider, and base URL onto the response, so the full principal + profile
+# ownership proof is required rather than treating the id as a read hint.
+_PUBLIC_OPTIONAL_LIVE_SESSION_READ_METHODS = frozenset({"model.options"})
+
+# These two methods establish a live session rather than consume one.  Their
+# handlers perform the corresponding server-side proof: create stamps the
+# verified principal + authorized profile, while resume queries state.db with
+# the verified owner and resolves the trusted profile before creating a record.
+_PUBLIC_SESSION_BOOTSTRAP_METHODS = frozenset({"session.create", "session.resume"})
+
+# Public mutations/execution are limited to an already-live, owned session.
+# Methods that mutate process-global/profile-global state (reload.*, browser,
+# projects CRUD, plugin/skill/cron/learning administration, raw CLI/shell and
+# slash/alias dispatch) are intentionally absent.
+_PUBLIC_LIVE_SESSION_METHODS = frozenset(
+    {
+        "approval.respond",
+        "complete.path",
+        "config.set",
+        "desktop.command",
+        "file.attach",
+        "handoff.fail",
+        "handoff.request",
+        "handoff.state",
+        "image.attach_bytes",
+        "image.detach",
+        "llm.oneshot",
+        "pdf.attach",
+        "preview.restart",
+        "process.kill",
+        "process.list",
+        "prompt.background",
+        "prompt.submit",
+        "session.activate",
+        "session.branch",
+        "session.close",
+        "session.compress",
+        "session.context_breakdown",
+        "session.cwd.set",
+        "session.history",
+        "session.interrupt",
+        "session.save",
+        "session.status",
+        "session.steer",
+        "session.title",
+        "session.undo",
+        "session.usage",
+        "terminal.resize",
+        "tools.configure",
+    }
+)
+
+# These replies predate a session_id parameter.  The opaque request id is
+# resolved through the server-owned pending map to its live session before the
+# response handler is allowed to see it.
+_PUBLIC_PENDING_REPLY_METHODS = frozenset(
+    {"clarify.respond", "secret.respond", "sudo.respond", "terminal.read.respond"}
+)
+
+_PUBLIC_CONFIG_GET_KEYS = frozenset({"project"})
+
+
+def _public_policy_error(rid: Any, message: str) -> dict:
+    return _err(rid, 4033, message)
+
+
+def _public_transport_profile_error(rid: Any) -> dict | None:
+    """Validate the transport-stamped profile without trusting RPC params."""
+    transport = current_transport()
+    if _transport_authenticated_principal(transport) is None:
+        return _public_policy_error(
+            rid, "public RPC transport has no verified authenticated principal"
+        )
+    authorized = str(getattr(transport, "authorized_profile", "") or "").strip()
+    if not authorized:
+        return _public_policy_error(
+            rid, "public RPC transport has no authorized profile scope"
+        )
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        profiles_mod.validate_profile_name(
+            profiles_mod.normalize_profile_name(authorized)
+        )
+    except Exception:
+        return _public_policy_error(
+            rid, "public RPC transport has an invalid authorized profile scope"
+        )
+    return None
+
+
+def _public_launch_profile_error(rid: Any) -> dict | None:
+    """Sessionless reads use launch-profile globals, so pin them to that scope."""
+    if error := _public_transport_profile_error(rid):
+        return error
+    from hermes_cli import profiles as profiles_mod
+
+    transport = current_transport()
+    authorized = profiles_mod.normalize_profile_name(
+        str(getattr(transport, "authorized_profile", "") or "")
+    )
+    current = profiles_mod.normalize_profile_name(_current_profile_name())
+    if authorized != current:
+        return _public_policy_error(
+            rid, "public RPC transport is not authorized for the launch profile"
+        )
+    return None
+
+
+def _public_live_session_error(
+    params: dict, rid: Any, *, session_id: str | None = None
+) -> dict | None:
+    """Require a live principal-owned session in the transport's profile."""
+    if error := _public_transport_profile_error(rid):
+        return error
+    sid = str(session_id if session_id is not None else params.get("session_id") or "")
+    with _sessions_lock:
+        session = _sessions.get(sid)
+    if session is None or session.get("_finalized"):
+        return _public_policy_error(
+            rid, "a valid owned live session is required for this public RPC"
+        )
+    if error := _session_principal_error(session, rid):
+        return error
+    try:
+        # This comparison uses the session's server-stamped profile and the
+        # transport's authenticated profile authority; params.profile is never
+        # part of the decision.
+        _resolve_session_profile_scope(_session_profile_name(session))
+    except PermissionError as exc:
+        return _public_policy_error(rid, str(exc))
+    except (OSError, ValueError) as exc:
+        return _public_policy_error(rid, f"session profile scope is invalid: {exc}")
+    return None
+
+
+def _public_config_set_error(params: dict, rid: Any) -> dict | None:
+    """Allow only mutations whose implementation is confined to one session."""
+    key = str(params.get("key") or "").strip().lower()
+    value = str(params.get("value") or "").strip()
+    if key == "yolo":
+        scope = str(params.get("scope") or "session").strip().lower()
+        if scope == "session":
+            return None
+    elif key == "fast":
+        return None
+    elif key == "reasoning":
+        from hermes_constants import parse_reasoning_effort
+
+        if parse_reasoning_effort(value) is not None:
+            return None
+    elif key == "model":
+        from hermes_cli.model_switch import parse_model_flags
+
+        _model, _provider, is_global, _refresh, _session = parse_model_flags(value)
+        if not is_global:
+            return None
+    return _public_policy_error(
+        rid,
+        "public config.set is limited to session-scoped model, fast, reasoning, and yolo changes",
+    )
+
+
+def _cwd_identity_without_probe(value: Any) -> str:
+    """Normalize a cwd for an authority comparison without touching the path.
+
+    Public RPC parameters are untrusted.  In particular, authorization must not
+    call ``isdir``/``resolve``/git on a candidate path merely to decide whether
+    the caller may use it: those operations are themselves an existence probe.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.expanduser(raw)))
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _public_create_cwd_error(params: dict, rid: Any) -> dict | None:
+    """Keep public session creation on the server-selected workspace."""
+    requested = str(params.get("cwd") or "").strip()
+    if not requested:
+        return None
+    # This is the launch profile's server-side workspace grant.  Compare only
+    # lexical identities: the client path must never be probed before authority
+    # is established.  The handler later derives the cwd again from server state.
+    trusted = _default_session_cwd()
+    if _cwd_identity_without_probe(requested) == _cwd_identity_without_probe(trusted):
+        return None
+    return _public_policy_error(
+        rid,
+        "public cwd override is not authorized; use the server-selected workspace",
+    )
+
+
+def _public_live_cwd_error(params: dict, rid: Any) -> dict | None:
+    """Reject a public cwd parameter outside its owned session workspace."""
+    requested = str(params.get("cwd") or "").strip()
+    if not requested:
+        return None
+    with _sessions_lock:
+        session = _sessions.get(str(params.get("session_id") or ""))
+    trusted = str((session or {}).get("cwd") or "").strip()
+    if trusted and _cwd_identity_without_probe(requested) == _cwd_identity_without_probe(
+        trusted
+    ):
+        return None
+    return _public_policy_error(
+        rid,
+        "public cwd override is not authorized; use the owned session workspace",
+    )
+
+
+def _authorize_public_request(method_name: str, params: dict, rid: Any) -> dict | None:
+    """Central fail-closed policy for non-operator WebSocket transports."""
+    if _transport_allows_profile_override():
+        return None
+
+    if method_name in _PUBLIC_READ_ONLY_METHODS:
+        return _public_launch_profile_error(rid)
+
+    if method_name in _PUBLIC_OPTIONAL_LIVE_SESSION_READ_METHODS:
+        if method_name == "model.options" and bool(params.get("refresh")):
+            return _public_policy_error(
+                rid, "public model.options does not permit provider refresh or probing"
+            )
+        if str(params.get("session_id") or ""):
+            return _public_live_session_error(params, rid)
+        return _public_launch_profile_error(rid)
+
+    if method_name == "config.get":
+        if str(params.get("key") or "").strip().lower() not in _PUBLIC_CONFIG_GET_KEYS:
+            return _public_policy_error(
+                rid, "public config.get is limited to project status"
+            )
+        # Branch/existence status is a filesystem probe.  A client-supplied cwd
+        # can never authorize it; only the workspace already stamped onto an
+        # owned live session can.  A matching cwd remains accepted as a harmless
+        # Desktop display hint, but the handler still reads the server value.
+        if error := _public_live_session_error(params, rid):
+            return error
+        return _public_live_cwd_error(params, rid)
+
+    if method_name in _PUBLIC_SESSION_BOOTSTRAP_METHODS:
+        if error := _public_transport_profile_error(rid):
+            return error
+        if method_name == "session.create":
+            return _public_create_cwd_error(params, rid)
+        if str(params.get("cwd") or "").strip():
+            return _public_policy_error(
+                rid, "public session resume does not accept a cwd override"
+            )
+        return None
+
+    if method_name in _PUBLIC_PENDING_REPLY_METHODS:
+        request_id = str(params.get("request_id") or "")
+        with _prompt_lock:
+            pending = _pending.get(request_id)
+        if pending is None:
+            return _public_policy_error(
+                rid, "a valid owned live-session prompt is required for this public RPC"
+            )
+        return _public_live_session_error(params, rid, session_id=pending[0])
+
+    if method_name in _PUBLIC_LIVE_SESSION_METHODS:
+        if error := _public_live_session_error(params, rid):
+            return error
+        if method_name == "file.attach" and not str(params.get("data_url") or "").strip():
+            return _public_policy_error(
+                rid,
+                "public file.attach requires uploaded data_url bytes; "
+                "gateway paths are not authorized",
+            )
+        if method_name == "pdf.attach" and not str(
+            params.get("content_base64") or params.get("data") or ""
+        ).strip():
+            return _public_policy_error(
+                rid,
+                "public pdf.attach requires uploaded PDF bytes; gateway paths are not authorized",
+            )
+        if method_name == "config.set":
+            return _public_config_set_error(params, rid)
+        if method_name in {"complete.path", "preview.restart", "session.cwd.set"}:
+            return _public_live_cwd_error(params, rid)
+        return None
+
+    return _public_policy_error(
+        rid, f"public authenticated transport is not authorized for RPC method: {method_name}"
+    )
+
+
 def handle_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
@@ -1248,6 +1835,18 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
+    if error := _authorize_public_request(method, params, rid):
+        return error
+    # Session ids are bearer-like routing handles, not authorization.  Apply
+    # the principal check centrally so even handlers that do not use _sess()
+    # (session.close and a few lightweight helpers) cannot mutate another
+    # authenticated client's live session.
+    sid = str(params.get("session_id") or "")
+    get_session = getattr(_sessions, "get", None)
+    if sid and callable(get_session):
+        if (session := get_session(sid)) is not None:
+            if error := _session_principal_error(session, rid):
+                return error
     return fn(rid, params)
 
 
@@ -1341,8 +1940,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
         worker = None
         notify_registered = False
         home_token = None
+        bridge_caller_token = None
         profile_home = current.get("profile_home")
         try:
+            bridge_caller_token = _set_desktop_bridge_caller_for_session(current)
             tokens = _set_session_context(key)
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
@@ -1462,6 +2063,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
+            _reset_desktop_bridge_caller(bridge_caller_token)
             # _attach_worker already closed the worker if this session was
             # reaped mid-build; only the late notify registration can still
             # leak (session.close unregistered before _build registered it).
@@ -1481,7 +2083,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 def _sess_nowait(params, rid):
     s = _sessions.get(params.get("session_id") or "")
-    return (s, None) if s else (None, _err(rid, 4001, "session not found"))
+    if s is None:
+        return None, _err(rid, 4001, "session not found")
+    if error := _session_principal_error(s, rid):
+        return None, error
+    return s, None
 
 
 def _sess(params, rid):
@@ -1750,6 +2356,9 @@ def _ensure_session_db_row(session: dict) -> None:
     parent_session_id = session.get("parent_session_id") or None
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
+    owner_kwargs = {}
+    if authenticated_owner := _session_authenticated_principal(session):
+        owner_kwargs["authenticated_owner"] = authenticated_owner
     try:
         db.create_session(
             key,
@@ -1758,7 +2367,12 @@ def _ensure_session_db_row(session: dict) -> None:
             model_config=model_config or None,
             parent_session_id=parent_session_id,
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
+            **owner_kwargs,
         )
+    except PermissionError:
+        # Ownership conflicts are authorization failures, not best-effort
+        # persistence errors. Callers at the RPC boundary must stop the action.
+        raise
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
@@ -1803,9 +2417,10 @@ def _session_db(session: dict):
     """Yield the SessionDB that owns this session's row (profile-aware).
 
     Mirrors :func:`_ensure_session_db_row`: a remote/profile session persists
-    into its own profile's ``state.db`` (a fresh handle we close on exit);
-    everything else borrows the shared ``_get_db()`` handle (left open). Yields
-    None when the db is unavailable.
+    into its own profile's ``state.db`` (a fresh handle closed on exit). Launch
+    profile sessions prefer their live agent's injected DB, then fall back to
+    the shared ``_get_db()`` handle (both left open). Yields None when the DB is
+    unavailable.
     """
     db, close_db = None, False
     profile_home = session.get("profile_home")
@@ -1817,13 +2432,41 @@ def _session_db(session: dict):
         except Exception:
             logger.debug("failed to open profile db for session", exc_info=True)
     else:
-        db = _get_db()
+        agent = session.get("agent")
+        db = getattr(agent, "_session_db", None) if agent is not None else None
+        if db is None:
+            db = _get_db()
     try:
         yield db
     finally:
         if close_db and db is not None:
             with contextlib.suppress(Exception):
                 db.close()
+
+
+class _LiveSessionTitleDB:
+    """Async-safe title-only facade over a live session's profile DB.
+
+    Auto-title runs after the request context is gone. Reopening through
+    ``_session_db`` for each operation keeps remote-profile handles scoped and
+    carries the trusted live-session owner into both the read and the write.
+    """
+
+    def __init__(self, session: dict):
+        self._session = session
+        self._owner_kwargs = _session_owner_kwargs(session)
+
+    def get_session_title(self, session_id: str):
+        with _session_db(self._session) as db:
+            if db is None:
+                return None
+            return db.get_session_title(session_id, **self._owner_kwargs)
+
+    def set_session_title(self, session_id: str, title: str):
+        with _session_db(self._session) as db:
+            if db is None:
+                return False
+            return db.set_session_title(session_id, title, **self._owner_kwargs)
 
 
 def _persist_session_git_meta(session: dict, cwd: str) -> None:
@@ -2017,6 +2660,28 @@ def _clear_session_context(tokens: list) -> None:
         from gateway.session_context import clear_session_vars
 
         clear_session_vars(tokens)
+    except Exception:
+        pass
+
+
+def _set_desktop_bridge_caller_for_session(session: dict):
+    """Bind the immutable principal captured when the session was attached."""
+    principal = _session_authenticated_principal(session)
+    try:
+        from tools.computer_use.desktop_bridge import set_desktop_bridge_caller
+
+        return set_desktop_bridge_caller(principal)
+    except Exception:
+        return None
+
+
+def _reset_desktop_bridge_caller(token) -> None:
+    if token is None:
+        return
+    try:
+        from tools.computer_use.desktop_bridge import reset_desktop_bridge_caller
+
+        reset_desktop_bridge_caller(token)
     except Exception:
         pass
 
@@ -2371,28 +3036,28 @@ def _persist_live_session_runtime(session: dict | None) -> None:
     if agent is None or not session_key:
         return
 
-    db = getattr(agent, "_session_db", None) or _get_db()
-    if db is None:
-        return
+    with _session_db(session) as db:
+        if db is None:
+            return
 
-    try:
-        row = db.get_session(session_key) or {}
-        raw_config = row.get("model_config")
-        existing_config = {}
-        if isinstance(raw_config, dict):
-            existing_config = raw_config
-        elif isinstance(raw_config, str) and raw_config.strip():
-            parsed = json.loads(raw_config)
-            if isinstance(parsed, dict):
-                existing_config = parsed
-        model_config = _runtime_model_config(agent, existing_config)
-        model = str(getattr(agent, "model", "") or "").strip()
-        if hasattr(db, "update_session_meta"):
-            db.update_session_meta(session_key, json.dumps(model_config), model or None)
-        elif model and hasattr(db, "update_session_model"):
-            db.update_session_model(session_key, model)
-    except Exception:
-        logger.debug("failed to persist live session runtime", exc_info=True)
+        try:
+            row = db.get_session(session_key) or {}
+            raw_config = row.get("model_config")
+            existing_config = {}
+            if isinstance(raw_config, dict):
+                existing_config = raw_config
+            elif isinstance(raw_config, str) and raw_config.strip():
+                parsed = json.loads(raw_config)
+                if isinstance(parsed, dict):
+                    existing_config = parsed
+            model_config = _runtime_model_config(agent, existing_config)
+            model = str(getattr(agent, "model", "") or "").strip()
+            if hasattr(db, "update_session_meta"):
+                db.update_session_meta(session_key, json.dumps(model_config), model or None)
+            elif model and hasattr(db, "update_session_model"):
+                db.update_session_model(session_key, model)
+        except Exception:
+            logger.debug("failed to persist live session runtime", exc_info=True)
 
 
 def _persist_live_session_system_prompt(session: dict | None) -> None:
@@ -2404,16 +3069,18 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     if agent is None or not session_key or not hasattr(agent, "_build_system_prompt"):
         return
 
-    db = getattr(agent, "_session_db", None) or _get_db()
-    if db is None or not hasattr(db, "update_system_prompt"):
-        return
+    with _session_db(session) as db:
+        if db is None or not hasattr(db, "update_system_prompt"):
+            return
 
-    try:
-        prompt = agent._build_system_prompt(None)
-        agent._cached_system_prompt = prompt
-        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
-    except Exception:
-        logger.debug("failed to persist live session system prompt", exc_info=True)
+        try:
+            prompt = agent._build_system_prompt(None)
+            agent._cached_system_prompt = prompt
+            db.update_system_prompt(
+                getattr(agent, "session_id", None) or session_key, prompt
+            )
+        except Exception:
+            logger.debug("failed to persist live session system prompt", exc_info=True)
 
 
 def _append_model_switch_marker(session: dict | None, *, model: str, provider: str) -> None:
@@ -4185,7 +4852,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "platform": "tui",
-        "session_db": _get_db(),
+        # Background work spawned by a remote-profile live agent must inherit
+        # that agent's owning DB rather than writing into the launch profile.
+        "session_db": getattr(agent, "_session_db", None) or _get_db(),
         "fallback_model": _agent_fallback_model(agent),
     }
 
@@ -4318,43 +4987,66 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
-    tokens = _set_session_context(session["session_key"])
+    profile_home = _validated_session_profile_home(session)
+    home_token = (
+        set_hermes_home_override(profile_home) if profile_home is not None else None
+    )
     try:
-        # Preserve this session's chosen model AND reasoning across /new so a
-        # reset doesn't silently revert to global config (or to a model
-        # another session set). See the cross-session-contamination note in
-        # _apply_model_switch.
-        reset_kw = {"model_override": session.get("model_override")}
-        old_reasoning = getattr(session.get("agent"), "reasoning_config", None)
-        if old_reasoning is None:
-            old_reasoning = session.get("create_reasoning_override")
-        if isinstance(old_reasoning, dict):
-            reset_kw["reasoning_config_override"] = old_reasoning
-        new_agent = _make_agent(
-            sid,
-            session["session_key"],
-            session_id=session["session_key"],
-            platform_override=_session_source(session),
-            **reset_kw,
-        )
+        session_db = None
+        if profile_home is not None:
+            from hermes_state import SessionDB
+
+            session_db = SessionDB(db_path=profile_home / "state.db")
+
+        bridge_caller_token = _set_desktop_bridge_caller_for_session(session)
+        tokens = _set_session_context(session["session_key"])
+        try:
+            # Preserve this session's chosen model AND reasoning across /new so a
+            # reset doesn't silently revert to global config (or to a model
+            # another session set). See the cross-session-contamination note in
+            # _apply_model_switch.
+            reset_kw = {"model_override": session.get("model_override")}
+            old_reasoning = getattr(session.get("agent"), "reasoning_config", None)
+            if old_reasoning is None:
+                old_reasoning = session.get("create_reasoning_override")
+            if isinstance(old_reasoning, dict):
+                reset_kw["reasoning_config_override"] = old_reasoning
+            try:
+                new_agent = _make_agent(
+                    sid,
+                    session["session_key"],
+                    session_id=session["session_key"],
+                    session_db=session_db,
+                    platform_override=_session_source(session),
+                    **reset_kw,
+                )
+            except Exception:
+                if session_db is not None:
+                    with contextlib.suppress(Exception):
+                        session_db.close()
+                raise
+        finally:
+            _clear_session_context(tokens)
+            _reset_desktop_bridge_caller(bridge_caller_token)
+        session["agent"] = new_agent
+        session["config_model_seen"] = _config_model_target()
+        session["attached_images"] = []
+        session["edit_snapshots"] = {}
+        session["image_counter"] = 0
+        session["running"] = False
+        session["show_reasoning"] = _load_show_reasoning()
+        session["tool_progress_mode"] = _load_tool_progress_mode()
+        session["tool_started_at"] = {}
+        with session["history_lock"]:
+            session["history"] = []
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        info = _session_info(new_agent, session)
+        _emit("session.info", sid, info)
+        _restart_slash_worker(sid, session)
+        return info
     finally:
-        _clear_session_context(tokens)
-    session["agent"] = new_agent
-    session["config_model_seen"] = _config_model_target()
-    session["attached_images"] = []
-    session["edit_snapshots"] = {}
-    session["image_counter"] = 0
-    session["running"] = False
-    session["show_reasoning"] = _load_show_reasoning()
-    session["tool_progress_mode"] = _load_tool_progress_mode()
-    session["tool_started_at"] = {}
-    with session["history_lock"]:
-        session["history"] = []
-        session["history_version"] = int(session.get("history_version", 0)) + 1
-    info = _session_info(new_agent, session)
-    _emit("session.info", sid, info)
-    _restart_slash_worker(sid, session)
-    return info
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 def _schedule_mcp_late_refresh(sid: str, agent) -> None:
@@ -4649,8 +5341,21 @@ def _init_session(
     cwd: str | None = None,
     session_db=None,
     source: str | None = None,
+    profile_home: str | Path | None = None,
+    profile: str | None = None,
+    authenticated_principal: tuple[str, str] | None = None,
+    transport: Transport | None = None,
 ):
     now = time.time()
+    bound_transport = transport or current_transport() or _stdio_transport
+    bound_principal = (
+        _normalized_authenticated_principal(authenticated_principal)
+        if authenticated_principal is not None
+        else _transport_authenticated_principal(bound_transport)
+    )
+    bound_profile = str(profile or "").strip() or (
+        Path(profile_home).name if profile_home is not None else _current_profile_name()
+    )
     with _sessions_lock:
         _sessions[sid] = {
             "agent": agent,
@@ -4672,13 +5377,16 @@ def _init_session(
             "tool_progress_mode": _load_tool_progress_mode(),
             "edit_snapshots": {},
             "tool_started_at": {},
+            "profile_home": str(profile_home) if profile_home is not None else None,
+            "profile": bound_profile,
+            "authenticated_principal": bound_principal,
             # Per-session model override set by an in-session /model switch.
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
             "model_override": None,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
-            "transport": current_transport() or _stdio_transport,
+            "transport": bound_transport,
         }
     db = session_db if session_db is not None else _get_db()
     if db is not None:
@@ -5178,11 +5886,19 @@ def _(rid, params: dict) -> dict:
     # workspace (see _ensure_session_db_row); otherwise it lands in "No
     # workspace" instead of whatever folder the desktop launched in.
     raw_cwd = str(params.get("cwd") or "").strip()
-    try:
-        explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
-    except Exception:
-        explicit_cwd = False
-    resolved_cwd = _completion_cwd(params)
+    public_transport = not _transport_allows_profile_override()
+    if public_transport:
+        # Authorization already established that a supplied value exactly
+        # matches the server-selected workspace.  Do not probe or derive
+        # authority from the client path here.
+        explicit_cwd = bool(raw_cwd)
+    else:
+        try:
+            explicit_cwd = bool(raw_cwd) and os.path.isdir(
+                os.path.abspath(os.path.expanduser(raw_cwd))
+            )
+        except Exception:
+            explicit_cwd = False
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     _enable_gateway_prompts()
 
@@ -5190,8 +5906,19 @@ def _(rid, params: dict) -> dict:
     # profile must build its agent + persist against THAT profile's home/state.db,
     # not the dashboard's launch profile. Stored on the session so _start_agent_build
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
+    try:
+        profile, profile_home = _resolve_session_profile_scope(params.get("profile"))
+    except PermissionError as exc:
+        return _err(rid, 4033, str(exc))
+    except (OSError, ValueError) as exc:
+        return _err(rid, 4004, str(exc))
+    scoped_params = dict(params)
+    scoped_params["profile"] = profile
+    if public_transport:
+        scoped_params.pop("cwd", None)
+    resolved_cwd = _completion_cwd(scoped_params)
+    bound_transport = current_transport() or _stdio_transport
+    bound_principal = _transport_authenticated_principal(bound_transport)
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -5249,6 +5976,8 @@ def _(rid, params: dict) -> dict:
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "profile": profile,
+            "authenticated_principal": bound_principal,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
@@ -5256,7 +5985,7 @@ def _(rid, params: dict) -> dict:
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
-            "transport": current_transport() or _stdio_transport,
+            "transport": bound_transport,
         }
         _register_session_cwd(_sessions[sid])
 
@@ -5302,7 +6031,7 @@ def _(rid, params: dict) -> dict:
                 "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-                "profile_name": _current_profile_name(),
+                "profile_name": profile,
             },
         },
     )
@@ -5329,9 +6058,16 @@ def _(rid, params: dict) -> dict:
         # short; the compression-tip projection in ``list_sessions_rich``
         # can also merge rows.
         fetch_limit = max(limit * 2, 200)
+        owner_kwargs = _stored_owner_kwargs()
         rows = [
             s
-            for s in db.list_sessions_rich(source=None, limit=fetch_limit, order_by_last_active=True, compact_rows=True)
+            for s in db.list_sessions_rich(
+                source=None,
+                limit=fetch_limit,
+                order_by_last_active=True,
+                compact_rows=True,
+                **owner_kwargs,
+            )
             if (s.get("source") or "").strip().lower() not in deny
         ][:limit]
         return _ok(
@@ -5378,7 +6114,13 @@ def _(rid, params: dict) -> dict:
         # users (lots of recent ``tool`` rows) don't get a false
         # "no eligible session" answer.  ``session.list`` uses a
         # similar over-fetch strategy.
-        rows = db.list_sessions_rich(source=None, limit=200, order_by_last_active=True, compact_rows=True)
+        rows = db.list_sessions_rich(
+            source=None,
+            limit=200,
+            order_by_last_active=True,
+            compact_rows=True,
+            **_stored_owner_kwargs(),
+        )
         for row in rows:
             src = (row.get("source") or "").strip().lower()
             if src in deny:
@@ -5469,6 +6211,9 @@ def _deferred_session_record(
     close_on_disconnect: bool = False,
     display_history_prefix: list | None = None,
     profile_home: Path | None = None,
+    profile: str | None = None,
+    authenticated_principal: tuple[str, str] | None = None,
+    transport: Transport | None = None,
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
@@ -5476,6 +6221,12 @@ def _deferred_session_record(
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
     now = time.time()
+    bound_transport = transport or current_transport() or _stdio_transport
+    bound_principal = (
+        _normalized_authenticated_principal(authenticated_principal)
+        if authenticated_principal is not None
+        else _transport_authenticated_principal(bound_transport)
+    )
     return {
         "agent": None,
         "agent_error": None,
@@ -5499,6 +6250,8 @@ def _deferred_session_record(
         "model_override": model_override,
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
+        "profile": str(profile or "").strip() or _current_profile_name(),
+        "authenticated_principal": bound_principal,
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
         "running": False,
@@ -5508,7 +6261,7 @@ def _deferred_session_record(
         "source": source,
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
-        "transport": current_transport() or _stdio_transport,
+        "transport": bound_transport,
     }
 
 
@@ -5519,7 +6272,9 @@ def _claim_or_reuse_live(
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(
+            session_key, profile=_session_profile_name(record)
+        )
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -5553,10 +6308,18 @@ def _(rid, params: dict) -> dict:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
         cols = 80
-    # ``profile`` (app-global remote mode): resume a session that lives in another
-    # local profile's state.db. None/own profile → the launch profile (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
+    # Resolve profile authority before opening any state.db or looking up a
+    # live session.  A public ticket cannot turn a client-supplied profile name
+    # into filesystem authority.
+    try:
+        profile, profile_home = _resolve_session_profile_scope(params.get("profile"))
+    except PermissionError as exc:
+        return _err(rid, 4033, str(exc))
+    except (OSError, ValueError) as exc:
+        return _err(rid, 4004, str(exc))
+    bound_transport = current_transport() or _stdio_transport
+    bound_principal = _transport_authenticated_principal(bound_transport)
+    owner_kwargs = _stored_owner_kwargs()
 
     # In a profile scope, the agent OWNS a long-lived db handle bound to that
     # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
@@ -5569,12 +6332,22 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
-    found = db.get_session(target)
+    found = db.get_session(target, **owner_kwargs)
     if not found:
-        found = db.get_session_by_title(target)
+        found = db.get_session_by_title(target, **owner_kwargs)
         if found:
             target = found["id"]
-        elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
+        elif owner_kwargs:
+            return _err(
+                rid,
+                4033,
+                "session is unowned or belongs to a different authenticated principal",
+            )
+        elif (
+            not owner_kwargs
+            and is_truthy_value(params.get("lazy", False))
+            and _child_run_active(target)
+        ):
             # Race: a watch window opened on a freshly-spawned subagent. The
             # child relays `subagent.start` (which carries child_session_id and
             # triggers the window) BEFORE its first run_conversation() flushes
@@ -5608,19 +6381,30 @@ def _(rid, params: dict) -> dict:
             tip = target
         if tip and tip != target:
             target = tip
-            found = db.get_session(target) or found
+            resolved = db.get_session(target, **owner_kwargs)
+            if owner_kwargs and resolved is None:
+                return _err(
+                    rid,
+                    4033,
+                    "session continuation is not owned by this authenticated principal",
+                )
+            found = resolved or found
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
     )
 
-    def _reuse_live_payload(sid: str, session: dict) -> dict:
+    def _reuse_live_response(sid: str, session: dict) -> dict:
+        if error := _session_principal_error(session, rid):
+            return error
+        if _session_profile_name(session) != profile:
+            return _err(rid, 4033, "live session belongs to a different profile")
         payload = _live_session_payload(
             sid,
             session,
             cols=cols,
             touch=True,
-            transport=current_transport() or _stdio_transport,
+            transport=bound_transport,
         )
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
@@ -5629,13 +6413,13 @@ def _(rid, params: dict) -> dict:
         if session.get("agent") is None and _child_run_active(target):
             payload["running"] = True
             payload["status"] = "streaming"
-        return payload
+        return _ok(rid, payload)
 
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(target, profile=profile)
         if live is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            return _reuse_live_response(*live)
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
     # Used by the desktop's subagent windows — the child runs inside the
@@ -5653,10 +6437,10 @@ def _(rid, params: dict) -> dict:
         if limit_message is not None:
             return _err(rid, 4090, limit_message)
         try:
-            db.reopen_session(target)
+            db.reopen_session(target, **owner_kwargs)
             # The child's OWN conversation only — include_ancestors would prepend
             # the parent's transcript onto the subagent's branch.
-            history = db.get_messages_as_conversation(target)
+            history = db.get_messages_as_conversation(target, **owner_kwargs)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5671,10 +6455,13 @@ def _(rid, params: dict) -> dict:
             source=source,
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
+            profile=profile,
+            authenticated_principal=bound_principal,
+            transport=bound_transport,
             lazy=True,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            return _reuse_live_response(*live)
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
@@ -5720,9 +6507,11 @@ def _(rid, params: dict) -> dict:
         # the deferred build wires the remaining per-session callbacks.
         _enable_gateway_prompts()
         try:
-            db.reopen_session(target)
-            raw_history = db.get_messages_as_conversation(target)
-            display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+            db.reopen_session(target, **owner_kwargs)
+            raw_history = db.get_messages_as_conversation(target, **owner_kwargs)
+            display_history = db.get_messages_as_conversation(
+                target, include_ancestors=True, **owner_kwargs
+            )
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5748,11 +6537,14 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             display_history_prefix=prefix,
             profile_home=profile_home,
+            profile=profile,
+            authenticated_principal=bound_principal,
+            transport=bound_transport,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            return _reuse_live_response(*live)
 
         _schedule_agent_build(sid)
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
@@ -5793,11 +6585,14 @@ def _(rid, params: dict) -> dict:
     home_token = (
         set_hermes_home_override(str(profile_home)) if profile_home is not None else None
     )
+    bridge_caller_token = _set_desktop_bridge_caller_for_session(
+        {"authenticated_principal": bound_principal}
+    )
     try:
-        db.reopen_session(target)
-        raw_history = db.get_messages_as_conversation(target)
+        db.reopen_session(target, **owner_kwargs)
+        raw_history = db.get_messages_as_conversation(target, **owner_kwargs)
         display_history = db.get_messages_as_conversation(
-            target, include_ancestors=True
+            target, include_ancestors=True, **owner_kwargs
         )
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
@@ -5836,12 +6631,13 @@ def _(rid, params: dict) -> dict:
     finally:
         if home_token is not None:
             reset_hermes_home_override(home_token)
+        _reset_desktop_bridge_caller(bridge_caller_token)
 
     # Double-checked locking: another concurrent resume may have created the
     # live session while we were building. Re-check under the lock; if it won,
     # discard our just-built agent and reuse theirs (no worker/poller wired yet).
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(target, profile=profile)
         if live is not None:
             try:
                 if hasattr(agent, "close"):
@@ -5851,15 +6647,7 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             other_sid, other_session = live
-            payload = _live_session_payload(
-                other_sid,
-                other_session,
-                cols=cols,
-                touch=True,
-                transport=current_transport() or _stdio_transport,
-            )
-            payload["resumed"] = target
-            return _ok(rid, payload)
+            return _reuse_live_response(other_sid, other_session)
         try:
             init_home_token = (
                 set_hermes_home_override(str(profile_home))
@@ -5876,6 +6664,10 @@ def _(rid, params: dict) -> dict:
                     cwd=profile_resume_cwd,
                     session_db=db,
                     source=source,
+                    profile_home=profile_home,
+                    profile=profile,
+                    authenticated_principal=bound_principal,
+                    transport=bound_transport,
                 )
             finally:
                 if init_home_token is not None:
@@ -5970,10 +6762,15 @@ def _message_preview(history: list) -> str:
 
 def _session_live_title(session: dict, key: str) -> str:
     title = str(session.get("pending_title") or "").strip()
-    db = _get_db()
-    if db is not None:
+    with _session_db(session) as db:
+        if db is None:
+            return title
         try:
-            title = str(db.get_session_title(key) or title or "").strip()
+            title = str(
+                db.get_session_title(key, **_session_owner_kwargs(session))
+                or title
+                or ""
+            ).strip()
         except Exception:
             pass
     return title
@@ -6014,9 +6811,13 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+def _find_live_session_by_key(
+    session_key: str, *, profile: str | None = None
+) -> tuple[str, dict] | None:
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
+            continue
+        if profile is not None and _session_profile_name(session) != profile:
             continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
@@ -6080,6 +6881,8 @@ def _(rid, params: dict) -> dict:
     without closing siblings.
     """
     current = str(params.get("current_session_id") or "")
+    public_owner = _public_authenticated_owner()
+    public_profile = _public_authorized_profile()
     try:
         with _sessions_lock:
             snapshot = list(_sessions.items())
@@ -6105,6 +6908,14 @@ def _(rid, params: dict) -> dict:
         _session_live_item(sid, session, current)
         for sid, session in snapshot
         if not session.get("_finalized")
+        and (
+            public_owner is None
+            or (
+                public_profile is not None
+                and _session_authenticated_principal(session) == public_owner
+                and _session_profile_name(session) == public_profile
+            )
+        )
     ]
     return _ok(rid, {"sessions": rows})
 
@@ -6150,6 +6961,8 @@ def _(rid, params: dict) -> dict:
     db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5036)
+    if error := _stored_session_access_error(db, target, rid):
+        return error
     # Block deletion of any session currently bound to a live TUI session
     # in this process.  The picker hides the active session anyway, but a
     # racing caller could still target it.  Snapshot via ``list(...)``
@@ -6167,7 +6980,11 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4023, "cannot delete an active session")
     sessions_dir = get_hermes_home() / "sessions"
     try:
-        deleted = db.delete_session(target, sessions_dir=sessions_dir)
+        deleted = db.delete_session(
+            target,
+            sessions_dir=sessions_dir,
+            **_stored_owner_kwargs(),
+        )
     except Exception as e:
         return _err(rid, 5036, f"delete failed: {e}")
     if not deleted:
@@ -6180,83 +6997,79 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5007)
     key = session["session_key"]
-    if "title" not in params:
-        fallback = session.get("pending_title") or ""
-        try:
-            resolved_title = db.get_session_title(key) or ""
-            if fallback:
-                if db.set_session_title(key, fallback):
-                    session["pending_title"] = None
-                    resolved_title = fallback
-                else:
-                    existing_row = db.get_session(key)
-                    existing_title = ((existing_row or {}).get("title") or "").strip()
-                    if existing_title == fallback:
+    owner_kwargs = _session_owner_kwargs(session)
+    with _session_db(session) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5007)
+        if "title" not in params:
+            fallback = session.get("pending_title") or ""
+            try:
+                resolved_title = db.get_session_title(key, **owner_kwargs) or ""
+                if fallback:
+                    if db.set_session_title(key, fallback, **owner_kwargs):
                         session["pending_title"] = None
                         resolved_title = fallback
-                    elif not resolved_title:
-                        resolved_title = fallback
-            elif resolved_title:
-                session["pending_title"] = None
-        except Exception:
-            resolved_title = fallback
-        _emit_session_info_for_session(params.get("session_id", ""), session)
-        return _ok(
-            rid,
-            {
-                "title": resolved_title,
-                "session_key": key,
-            },
-        )
-    title = (params.get("title", "") or "").strip()
-    if not title:
-        return _err(rid, 4021, "title required")
-    try:
-        if db.set_session_title(key, title):
-            session["pending_title"] = None
-            _emit_session_info_for_session(params.get("session_id", ""), session)
-            return _ok(rid, {"pending": False, "title": title})
-        # rowcount == 0 can mean "same value" as well as "missing row".
-        existing_row = db.get_session(key)
-        if existing_row:
-            session["pending_title"] = None
+                    else:
+                        existing_row = db.get_session(key, **owner_kwargs)
+                        existing_title = (
+                            (existing_row or {}).get("title") or ""
+                        ).strip()
+                        if existing_title == fallback:
+                            session["pending_title"] = None
+                            resolved_title = fallback
+                        elif not resolved_title:
+                            resolved_title = fallback
+                elif resolved_title:
+                    session["pending_title"] = None
+            except Exception:
+                resolved_title = fallback
             _emit_session_info_for_session(params.get("session_id", ""), session)
             return _ok(
                 rid,
                 {
-                    "pending": False,
-                    "title": (existing_row.get("title") or title),
+                    "title": resolved_title,
+                    "session_key": key,
                 },
             )
-        # No row yet (the DB write is deferred to the first prompt so empty
-        # drafts don't litter the sidebar). An explicit /title is clear user
-        # intent, not an abandoned draft — so persist the row NOW and set the
-        # title, mirroring the messaging gateway's _handle_title_command. The
-        # old behavior only queued pending_title and relied on the post-turn
-        # apply block; if that turn never landed under this session_key the
-        # title was silently lost and the sidebar fell back to the message
-        # preview. Creating the row up front removes that race entirely. The
-        # min-messages sidebar filter keeps a titled 0-message row hidden, so
-        # a /title'd-but-never-used draft still doesn't clutter the list.
-        _ensure_session_db_row(session)
-        with _session_db(session) as scoped_db:
-            if scoped_db is not None and scoped_db.set_session_title(key, title):
+
+        title = (params.get("title", "") or "").strip()
+        if not title:
+            return _err(rid, 4021, "title required")
+        try:
+            if db.set_session_title(key, title, **owner_kwargs):
                 session["pending_title"] = None
                 _emit_session_info_for_session(params.get("session_id", ""), session)
                 return _ok(rid, {"pending": False, "title": title})
-        # Row creation didn't take (DB unavailable, or a concurrent writer) —
-        # fall back to queuing so the post-turn apply block can still recover.
-        session["pending_title"] = title
-        _emit_session_info_for_session(params.get("session_id", ""), session)
-        return _ok(rid, {"pending": True, "title": title})
-    except ValueError as e:
-        return _err(rid, 4022, str(e))
-    except Exception as e:
-        return _err(rid, 5007, str(e))
+            # rowcount == 0 can mean "same value" as well as "missing row".
+            existing_row = db.get_session(key, **owner_kwargs)
+            if existing_row:
+                session["pending_title"] = None
+                _emit_session_info_for_session(params.get("session_id", ""), session)
+                return _ok(
+                    rid,
+                    {
+                        "pending": False,
+                        "title": (existing_row.get("title") or title),
+                    },
+                )
+            # No row yet (the DB write is deferred to the first prompt so empty
+            # drafts don't litter the sidebar). An explicit /title is clear user
+            # intent, so persist the row now before setting its title.
+            _ensure_session_db_row(session)
+            if db.set_session_title(key, title, **owner_kwargs):
+                session["pending_title"] = None
+                _emit_session_info_for_session(params.get("session_id", ""), session)
+                return _ok(rid, {"pending": False, "title": title})
+            # Row creation didn't take (DB unavailable, or a concurrent writer)
+            # — queue it so the post-turn apply block can still recover.
+            session["pending_title"] = title
+            _emit_session_info_for_session(params.get("session_id", ""), session)
+            return _ok(rid, {"pending": True, "title": title})
+        except ValueError as e:
+            return _err(rid, 4022, str(e))
+        except Exception as e:
+            return _err(rid, 5007, str(e))
 
 
 def _main_runtime_from_agent(agent) -> dict | None:
@@ -6395,15 +7208,23 @@ def _(rid, params: dict) -> dict:
 
     # The watcher transfers a persisted DB row, so make sure one exists even
     # for a brand-new empty chat (mirrors the CLI's set_session_title stub).
-    _ensure_session_db_row(session)
+    try:
+        _ensure_session_db_row(session)
+    except PermissionError as exc:
+        return _err(rid, 4033, str(exc))
 
     with _session_db(session) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5007)
         key = session["session_key"]
+        if error := _stored_session_access_error(db, key, rid):
+            return error
         try:
-            if not db.get_session(key):
-                db.set_session_title(key, f"handoff-{key[:8]}")
+            owner_kwargs = _stored_owner_kwargs()
+            if not db.get_session(key, **owner_kwargs):
+                db.set_session_title(
+                    key, f"handoff-{key[:8]}", **owner_kwargs
+                )
             ok = db.request_handoff(key, platform_name)
         except Exception as e:
             return _err(rid, 5007, str(e))
@@ -6487,18 +7308,18 @@ def _(rid, params: dict) -> dict:
         if agent is not None
         else {"calls": 0, "input": 0, "output": 0, "total": 0}
     )
-    # Nous credits block — agent-independent (a portal fetch), so it shows even
-    # with zero API calls or on a resumed session. The TUI /usage panel renders
-    # these lines regardless of `calls`. Fail-open: [] when not logged into Nous
-    # or on any portal hiccup.
-    try:
-        from agent.account_usage import nous_credits_lines
+    # Nous credits are a credentialed portal probe. Local/operator transports
+    # keep the richer panel; a public ticket receives only usage already held
+    # by its owned live agent and cannot turn this read RPC into network I/O.
+    if _transport_allows_profile_override():
+        try:
+            from agent.account_usage import nous_credits_lines
 
-        credits = nous_credits_lines()
-        if credits:
-            usage["credits_lines"] = credits
-    except Exception:
-        pass
+            credits = nous_credits_lines()
+            if credits:
+                usage["credits_lines"] = credits
+        except Exception:
+            pass
     return _ok(rid, usage)
 
 
@@ -7771,12 +8592,12 @@ def _(rid, params: dict) -> dict:
     key = session.get("session_key") or params.get("session_id") or ""
     agent = session.get("agent")
     meta = {}
-    db = _get_db()
-    if db and key:
-        try:
-            meta = db.get_session(key) or {}
-        except Exception:
-            meta = {}
+    with _session_db(session) as db:
+        if db and key:
+            try:
+                meta = db.get_session(key, **_session_owner_kwargs(session)) or {}
+            except Exception:
+                meta = {}
 
     def _dt(value, fallback: datetime | None = None) -> datetime:
         if value:
@@ -7800,8 +8621,9 @@ def _(rid, params: dict) -> dict:
         "Hermes TUI Status",
         "",
         f"Session ID: {key}",
-        f"Path: {display_hermes_home()}",
     ]
+    if _transport_allows_profile_override():
+        lines.append(f"Path: {session.get('profile_home') or display_hermes_home()}")
     title = (meta.get("title") or "").strip()
     if title:
         lines.append(f"Title: {title}")
@@ -7823,14 +8645,16 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     history = list(session.get("history", []))
-    db = _get_db()
-    if db is not None and session.get("session_key"):
-        try:
-            history = db.get_messages_as_conversation(
-                session["session_key"], include_ancestors=True
-            )
-        except Exception:
-            pass
+    with _session_db(session) as db:
+        if db is not None and session.get("session_key"):
+            try:
+                history = db.get_messages_as_conversation(
+                    session["session_key"],
+                    include_ancestors=True,
+                    **_session_owner_kwargs(session),
+                )
+            except Exception:
+                pass
     return _ok(
         rid,
         {
@@ -7974,7 +8798,11 @@ def _(rid, params: dict) -> dict:
     # Mirror the classic CLI /save: snapshot under the Hermes profile home
     # (~/.hermes/sessions/saved/) rather than the project/workspace CWD, and
     # include the system prompt so the export matches the dashboard save.
-    saved_dir = get_hermes_home() / "sessions" / "saved"
+    try:
+        profile_home = _validated_session_profile_home(session)
+    except ValueError as e:
+        return _err(rid, 5011, str(e))
+    saved_dir = (profile_home or get_hermes_home()) / "sessions" / "saved"
     try:
         saved_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -8014,7 +8842,9 @@ def _(rid, params: dict) -> dict:
                 indent=2,
                 ensure_ascii=False,
             )
-        return _ok(rid, {"file": str(path)})
+        if _transport_allows_profile_override():
+            return _ok(rid, {"file": str(path)})
+        return _ok(rid, {"file": path.name})
     except Exception as e:
         return _err(rid, 5011, str(e))
 
@@ -8022,6 +8852,9 @@ def _(rid, params: dict) -> dict:
 @method("session.close")
 def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
+    if (session := _sessions.get(sid)) is not None:
+        if error := _session_principal_error(session, rid):
+            return error
     # Serialize against the WS-orphan reaper (which also pops under
     # _session_resume_lock) so a disconnect-reap and an explicit close can't
     # both tear the same session down. _close_session_by_id is the single
@@ -8036,9 +8869,12 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5008)
+    parent_principal = _session_authenticated_principal(session)
+    parent_profile = _session_profile_name(session)
+    try:
+        profile_home = _validated_session_profile_home(session)
+    except ValueError as exc:
+        return _err(rid, 5008, str(exc))
     old_key = session["session_key"]
     with session["history_lock"]:
         history = [dict(msg) for msg in session.get("history", [])]
@@ -8052,17 +8888,45 @@ def _(rid, params: dict) -> dict:
     )
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
+    owns_db = profile_home is not None
+    if owns_db:
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB(db_path=profile_home / "state.db")
+        except Exception as exc:
+            if lease is not None:
+                lease.release()
+            return _err(rid, 5008, f"branch failed: {exc}")
+    else:
+        db = _get_db()
+    if db is None:
+        if lease is not None:
+            lease.release()
+        return _db_unavailable_error(rid, code=5008)
+    home_token = (
+        set_hermes_home_override(str(profile_home))
+        if profile_home is not None
+        else None
+    )
     branch_name = params.get("name", "")
     try:
         if branch_name:
             title = branch_name
         else:
-            current = db.get_session_title(old_key) or "branch"
+            current = db.get_session_title(
+                old_key, **_stored_owner_kwargs()
+            ) or "branch"
             title = (
-                db.get_next_title_in_lineage(current)
+                db.get_next_title_in_lineage(current, **_stored_owner_kwargs())
                 if hasattr(db, "get_next_title_in_lineage")
                 else f"{current} (branch)"
             )
+        owner_kwargs = (
+            {"authenticated_owner": parent_principal}
+            if parent_principal is not None
+            else {}
+        )
         db.create_session(
             new_key,
             source=source,
@@ -8075,6 +8939,7 @@ def _(rid, params: dict) -> dict:
             model_config={"_branched_from": old_key},
             parent_session_id=old_key,
             cwd=_session_cwd(session),
+            **owner_kwargs,
         )
         for msg in history:
             db.append_message(
@@ -8082,36 +8947,56 @@ def _(rid, params: dict) -> dict:
                 role=msg.get("role", "user"),
                 content=msg.get("content"),
             )
-        db.set_session_title(new_key, title)
+        db.set_session_title(new_key, title, **_stored_owner_kwargs())
     except Exception as e:
         if lease is not None:
             lease.release()
+        if owns_db:
+            with contextlib.suppress(Exception):
+                db.close()
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
         return _err(rid, 5008, f"branch failed: {e}")
     try:
+        bridge_caller_token = _set_desktop_bridge_caller_for_session(session)
         tokens = _set_session_context(new_key)
         try:
             agent = _make_agent(
                 new_sid,
                 new_key,
                 session_id=new_key,
+                session_db=db,
                 platform_override=source,
             )
         finally:
             _clear_session_context(tokens)
+            _reset_desktop_bridge_caller(bridge_caller_token)
         _init_session(
             new_sid,
             new_key,
             agent,
             list(history),
             cols=session.get("cols", 80),
+            cwd=_session_cwd(session),
+            session_db=db,
             source=source,
+            profile_home=profile_home,
+            profile=parent_profile,
+            authenticated_principal=parent_principal,
+            transport=current_transport() or session.get("transport"),
         )
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
     except Exception as e:
         if lease is not None:
             lease.release()
+        if owns_db:
+            with contextlib.suppress(Exception):
+                db.close()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
     return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
 
 
@@ -8464,9 +9349,10 @@ def _(rid, params: dict) -> dict:
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
-            if (db := _get_db()) is not None:
+            with _session_db(session) as db:
                 try:
-                    db.replace_messages(session["session_key"], truncated)
+                    if db is not None:
+                        db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
@@ -8475,7 +9361,13 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     # Persist the DB row lazily, now that the user has actually sent a message.
-    _ensure_session_db_row(session)
+    try:
+        _ensure_session_db_row(session)
+    except PermissionError as exc:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        return _err(rid, 4033, str(exc))
     # A branch becomes real here: copy its parent's transcript into the row so it
     # resumes with full context (the agent won't persist the seed itself).
     _persist_branch_seed(session)
@@ -8552,9 +9444,9 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
     # desktop session instead of becoming an orphan that any poller may consume.
     resolved_key = evt_key
     try:
-        db = _get_db()
-        if db is not None:
-            resolved_key = db.resolve_resume_session_id(evt_key) or evt_key
+        with _session_db(session) as db:
+            if db is not None:
+                resolved_key = db.resolve_resume_session_id(evt_key) or evt_key
     except Exception:
         resolved_key = evt_key
 
@@ -8626,10 +9518,10 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     if evt_key in current_keys:
         return True
     try:
-        db = _get_db()
-        resolved_key = (
-            db.resolve_resume_session_id(evt_key) if db is not None else evt_key
-        ) or evt_key
+        with _session_db(session) as db:
+            resolved_key = (
+                db.resolve_resume_session_id(evt_key) if db is not None else evt_key
+            ) or evt_key
     except Exception:
         resolved_key = evt_key
     return resolved_key in current_keys
@@ -8910,6 +9802,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
+        bridge_caller_token = None
         goal_followup = None  # set by the post-turn goal hook below
         try:
             from tools.approval import (
@@ -8918,6 +9811,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             )
 
             approval_token = set_current_session_key(session["session_key"])
+            bridge_caller_token = _set_desktop_bridge_caller_for_session(session)
             session_tokens = _set_session_context(
                 session["session_key"],
                 ui_session_id=sid,
@@ -9218,11 +10112,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
             if _pending and status == "complete":
-                _pdb = _get_db()
-                if _pdb:
+                with _session_db(session) as _pdb:
                     _session_key = session.get("session_key") or sid
                     try:
-                        if _pdb.set_session_title(_session_key, _pending):
+                        if _pdb is not None and _pdb.set_session_title(
+                            _session_key,
+                            _pending,
+                            **_session_owner_kwargs(session),
+                        ):
                             session["pending_title"] = None
                     except ValueError as exc:
                         # Invalid/duplicate title — non-retryable, drop it.
@@ -9248,7 +10145,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
                     _title_key = session.get("session_key") or sid
                     maybe_auto_title(
-                        _get_db(),
+                        _LiveSessionTitleDB(session),
                         _title_key,
                         text,
                         raw,
@@ -9310,6 +10207,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 pass
             if home_token is not None:
                 reset_hermes_home_override(home_token)
+            _reset_desktop_bridge_caller(bridge_caller_token)
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
@@ -9782,9 +10680,21 @@ def _attachment_ref_path(session: dict, target: Path) -> str:
         return str(target.resolve())
 
 
-def _desktop_attachment_dir(session: dict) -> Path:
-    root = Path(_session_cwd(session)).resolve() / ".hermes" / "desktop-attachments"
+def _desktop_attachment_dir(
+    session: dict, *, require_workspace_containment: bool = False
+) -> Path:
+    workspace = Path(_session_cwd(session)).resolve()
+    root = workspace / ".hermes" / "desktop-attachments"
     root.mkdir(parents=True, exist_ok=True)
+    if require_workspace_containment:
+        resolved = root.resolve(strict=True)
+        try:
+            resolved.relative_to(workspace)
+        except ValueError as exc:
+            raise PermissionError(
+                "public attachment staging directory escapes the owned session workspace"
+            ) from exc
+        return resolved
     return root
 
 
@@ -9799,14 +10709,14 @@ def _sanitize_attachment_name(name: str) -> str:
 
 def _unique_attachment_path(root: Path, filename: str) -> Path:
     candidate = root / filename
-    if not candidate.exists():
+    if not candidate.exists() and not candidate.is_symlink():
         return candidate
     stem = Path(filename).stem or "attachment"
     suffix = Path(filename).suffix
     counter = 2
     while True:
         next_candidate = root / f"{stem}-{counter}{suffix}"
-        if not next_candidate.exists():
+        if not next_candidate.exists() and not next_candidate.is_symlink():
             return next_candidate
         counter += 1
 
@@ -9856,22 +10766,23 @@ def _stage_session_file_attachment(
     raw_path: str,
     data_url: str,
     name: str,
+    allow_gateway_path: bool = True,
 ) -> tuple[Path, bool]:
     """Make a desktop file attachment available to the remote gateway agent.
 
     Three cases:
-      1. The path resolves to a file already INSIDE the session workspace — use
-         it as-is (no copy, ``uploaded=False``).
-      2. The path resolves to a gateway-visible file OUTSIDE the workspace — copy
-         it into ``.hermes/desktop-attachments/`` so the ``@file:`` ref resolves.
-      3. The path doesn't exist on the gateway (the common remote case: it's a
-         path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
-         write them into ``.hermes/desktop-attachments/``.
+      1. For trusted local/operator transports, a path already INSIDE the session
+         workspace is used as-is (no copy, ``uploaded=False``).
+      2. For trusted local/operator transports, a gateway-visible file OUTSIDE
+         the workspace is copied into ``.hermes/desktop-attachments/``.
+      3. For public transports, gateway path resolution is disabled and the
+         uploaded ``data_url`` bytes are always staged. ``raw_path`` is only a
+         sanitized filename hint in that case.
 
     Returns ``(stored_path, uploaded)``.
     """
     workspace = Path(_session_cwd(session)).resolve()
-    resolved = _resolve_gateway_attachment_path(raw_path)
+    resolved = _resolve_gateway_attachment_path(raw_path) if allow_gateway_path else None
     if resolved is not None:
         try:
             resolved.relative_to(workspace)
@@ -9885,7 +10796,10 @@ def _stage_session_file_attachment(
         payload = _decode_attachment_data_url(data_url)
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
 
-    upload_dir = _desktop_attachment_dir(session)
+    upload_dir = _desktop_attachment_dir(
+        session,
+        require_workspace_containment=not allow_gateway_path,
+    )
     target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
     target.write_bytes(payload)
     return target.resolve(), True
@@ -9920,7 +10834,11 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4015, "path or data_url required")
     try:
         stored_path, uploaded = _stage_session_file_attachment(
-            session, raw_path=raw, data_url=data_url, name=name
+            session,
+            raw_path=raw,
+            data_url=data_url,
+            name=name,
+            allow_gateway_path=_transport_allows_profile_override(),
         )
         ref_path = _attachment_ref_path(session, stored_path)
         return _ok(
@@ -9934,6 +10852,8 @@ def _(rid, params: dict) -> dict:
                 "uploaded": uploaded,
             },
         )
+    except PermissionError as e:
+        return _err(rid, 4033, str(e))
     except Exception as e:
         return _err(rid, 5028, str(e))
 
@@ -10013,9 +10933,19 @@ def _(rid, params: dict) -> dict:
     text, parent = params.get("text", ""), params.get("session_id", "")
     if not text:
         return _err(rid, 4012, "text required")
+    try:
+        profile_home = _validated_session_profile_home(session)
+    except ValueError as exc:
+        return _err(rid, 5008, str(exc))
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
 
     def run():
+        home_token = (
+            set_hermes_home_override(str(profile_home))
+            if profile_home is not None
+            else None
+        )
+        bridge_caller_token = _set_desktop_bridge_caller_for_session(session)
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
         try:
             from run_agent import AIAgent
@@ -10046,6 +10976,9 @@ def _(rid, params: dict) -> dict:
             )
         finally:
             _clear_session_context(session_tokens)
+            _reset_desktop_bridge_caller(bridge_caller_token)
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"task_id": task_id})
@@ -10059,6 +10992,15 @@ def _(rid, params: dict) -> dict:
 
     url = str(params.get("url") or "").strip()
     cwd = str(params.get("cwd") or "").strip()
+    try:
+        profile_home = _validated_session_profile_home(session)
+    except ValueError as exc:
+        return _err(rid, 5008, str(exc))
+    if not _transport_allows_profile_override():
+        # The policy layer has already rejected any mismatch.  Re-read the
+        # server-stamped value so the background agent never derives process
+        # authority from a client field, even when the display hint matched.
+        cwd = _session_cwd(session)
     context = str(params.get("context") or "").strip()
 
     if not url:
@@ -10113,6 +11055,12 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
+        home_token = (
+            set_hermes_home_override(str(profile_home))
+            if profile_home is not None
+            else None
+        )
+        bridge_caller_token = _set_desktop_bridge_caller_for_session(session)
         session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
         try:
             from run_agent import AIAgent
@@ -10159,6 +11107,9 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 pass
             _clear_session_context(session_tokens)
+            _reset_desktop_bridge_caller(bridge_caller_token)
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"task_id": task_id})
@@ -10269,6 +11220,12 @@ def _(rid, params: dict) -> dict:
                         params.get("confirm_expensive_model", False)
                     ),
                     parsed_flags=parsed_flags,
+                    # Public OAuth tickets may select the live session's model,
+                    # but may never turn that into a profile-global config
+                    # write. Operator/stdio behavior remains unchanged.
+                    persist_override=(
+                        False if not _transport_allows_profile_override() else None
+                    ),
                 )
             else:
                 result = _apply_model_switch(
@@ -10336,7 +11293,15 @@ def _(rid, params: dict) -> dict:
                     "fast mode is not available for this model",
                 )
 
-        _write_config_key("agent.service_tier", nv)
+        public_session_scope = not _transport_allows_profile_override()
+        if public_session_scope:
+            # Keep a lazy session's choice available to its eventual build,
+            # without changing the profile default for other sessions.
+            session["create_service_tier_override"] = (
+                "priority" if nv == "fast" else ""
+            )
+        else:
+            _write_config_key("agent.service_tier", nv)
         if agent is not None:
             agent.service_tier = "priority" if nv == "fast" else None
             current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -10924,7 +11889,13 @@ def _is_repo_junk(root: str) -> bool:
     return real == home or real == hermes_home or real.startswith(hermes_home + os.sep)
 
 
-def _discover_repos_payload(db, *, conn=None, backfill: bool = True) -> list[dict]:
+def _discover_repos_payload(
+    db,
+    *,
+    conn=None,
+    backfill: bool = True,
+    authenticated_owner: tuple[str, str] | None = None,
+) -> list[dict]:
     """Merge filesystem-scanned repos (cached) with session-derived repo roots.
 
     Repo-first: the disk scan (persisted by `projects.record_repos`) surfaces
@@ -10945,7 +11916,12 @@ def _discover_repos_payload(db, *, conn=None, backfill: bool = True) -> list[dic
 
     # Session-derived roots (common repo root, folding worktrees; cached) +
     # backfill the column so persisted git_repo_root matches the tree grouping.
-    cwd_rows = list(db.distinct_session_cwds())
+    owner_kwargs = (
+        {"authenticated_owner": authenticated_owner}
+        if authenticated_owner is not None
+        else {}
+    )
+    cwd_rows = list(db.distinct_session_cwds(**owner_kwargs))
     # Warm the per-cwd git probes in parallel so a cold first paint doesn't
     # serialize one subprocess per distinct cwd before this loop reads the cache.
     git_probe.warm_roots(str(r.get("cwd") or "") for r in cwd_rows)
@@ -10964,7 +11940,7 @@ def _discover_repos_payload(db, *, conn=None, backfill: bool = True) -> list[dic
 
     if backfill:
         try:
-            db.backfill_repo_roots(cwd_to_root)
+            db.backfill_repo_roots(cwd_to_root, **owner_kwargs)
         except Exception:
             logger.debug("failed to backfill repo roots", exc_info=True)
 
@@ -11004,7 +11980,14 @@ def _(rid, params: dict) -> dict:
         db = _get_db()
         if db is None:
             return _ok(rid, {"repos": []})
-        return _ok(rid, {"repos": _discover_repos_payload(db)})
+        return _ok(
+            rid,
+            {
+                "repos": _discover_repos_payload(
+                    db, authenticated_owner=_public_authenticated_owner()
+                )
+            },
+        )
     except Exception as e:
         return _err(rid, 5061, str(e))
 
@@ -11028,7 +12011,18 @@ def _(rid, params: dict) -> dict:
             pdb.record_discovered_repos(conn, pairs, replace=True)
 
         db = _get_db()
-        return _ok(rid, {"repos": _discover_repos_payload(db) if db is not None else []})
+        return _ok(
+            rid,
+            {
+                "repos": (
+                    _discover_repos_payload(
+                        db, authenticated_owner=_public_authenticated_owner()
+                    )
+                    if db is not None
+                    else []
+                )
+            },
+        )
     except Exception as e:
         return _err(rid, 5061, str(e))
 
@@ -11073,7 +12067,11 @@ def _project_tree_row(r: dict) -> dict:
 
 
 def _project_tree_inputs(
-    db, session_limit: int, *, include_discovered: bool
+    db,
+    session_limit: int,
+    *,
+    include_discovered: bool,
+    authenticated_owner: tuple[str, str] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], str | None]:
     """Gather (sessions, projects, discovered_repos, active_id) for build_tree.
 
@@ -11090,6 +12088,11 @@ def _project_tree_inputs(
         include_children=False,
         exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
         include_archived=False,
+        **(
+            {"authenticated_owner": authenticated_owner}
+            if authenticated_owner is not None
+            else {}
+        ),
     )
     sessions = [_project_tree_row(r) for r in rows]
     # Parallel-warm the git cache so build_tree's resolver reads it instead of
@@ -11103,19 +12106,37 @@ def _project_tree_inputs(
         projects = [p.to_dict() for p in pdb.list_projects(conn)]
         active_id = pdb.get_active_id(conn)
         # backfill stays off the hot tree path — grouping uses the live resolver.
-        discovered = _discover_repos_payload(db, conn=conn, backfill=False) if include_discovered else []
+        discovered = (
+            _discover_repos_payload(
+                db,
+                conn=conn,
+                backfill=False,
+                authenticated_owner=authenticated_owner,
+            )
+            if include_discovered
+            else []
+        )
 
     return sessions, projects, discovered, active_id
 
 
 def _build_project_tree(
-    db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool
+    db,
+    *,
+    preview_limit: int,
+    hydrate: bool,
+    session_limit: int,
+    include_discovered: bool,
+    authenticated_owner: tuple[str, str] | None = None,
 ) -> tuple[dict, str | None]:
     """Gather inputs and run the one authoritative builder. Returns (tree, active_id)."""
     from tui_gateway import project_tree
 
     sessions, projects, discovered, active_id = _project_tree_inputs(
-        db, session_limit, include_discovered=include_discovered
+        db,
+        session_limit,
+        include_discovered=include_discovered,
+        authenticated_owner=authenticated_owner,
     )
     tree = project_tree.build_tree(
         projects,
@@ -11147,6 +12168,7 @@ def _(rid, params: dict) -> dict:
             hydrate=False,
             session_limit=int(params.get("session_limit") or 2000),
             include_discovered=True,
+            authenticated_owner=_public_authenticated_owner(),
         )
         return _ok(
             rid,
@@ -11175,6 +12197,7 @@ def _(rid, params: dict) -> dict:
         tree, _active = _build_project_tree(
             db, preview_limit=0, hydrate=True, session_limit=int(params.get("session_limit") or 5000),
             include_discovered=False,
+            authenticated_owner=_public_authenticated_owner(),
         )
         proj = next((p for p in tree["projects"] if p["id"] == project_id), None)
         return _ok(rid, {"project": proj})
@@ -11208,6 +12231,17 @@ def _(rid, params: dict) -> dict:
 
         return _ok(rid, {"home": str(_hermes_home), "display": display_hermes_home()})
     if key == "project":
+        if not _transport_allows_profile_override():
+            session = _sessions.get(str(params.get("session_id") or ""))
+            cwd = str((session or {}).get("cwd") or "").strip()
+            if not cwd:
+                return _err(
+                    rid,
+                    4033,
+                    "owned live session has no server-recorded project cwd",
+                )
+            return _ok(rid, {"cwd": cwd, "branch": _git_branch_for_cwd(cwd)})
+
         cfg_terminal = _load_cfg().get("terminal") or {}
         raw = str(params.get("cwd", "") or cfg_terminal.get("cwd", "") or "").strip()
         cwd = _completion_cwd({"cwd": raw} if raw else {})
@@ -11336,12 +12370,58 @@ def _(rid, params: dict) -> dict:
     return _err(rid, 4002, f"unknown config key: {key}")
 
 
+def _public_provider_configuration_present() -> bool:
+    """Check local provider state without invoking a credential/runtime probe."""
+    cfg = _load_cfg()
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    selected_provider = ""
+    if isinstance(model_cfg, dict):
+        selected_provider = str(model_cfg.get("provider") or "").strip().lower()
+        if any(
+            str(model_cfg.get(field) or "").strip()
+            for field in ("provider", "base_url", "api_key")
+        ):
+            return True
+
+    try:
+        from hermes_cli.auth import (
+            PROVIDER_REGISTRY,
+            get_active_provider,
+            get_provider_auth_state,
+            read_credential_pool,
+        )
+
+        for provider in PROVIDER_REGISTRY.values():
+            env_names = tuple(provider.api_key_env_vars) + (
+                (provider.base_url_env_var,) if provider.base_url_env_var else ()
+            )
+            if any(str(os.getenv(name) or "").strip() for name in env_names):
+                return True
+
+        active_provider = str(get_active_provider() or "").strip().lower()
+        if active_provider:
+            return True
+        if selected_provider and (
+            get_provider_auth_state(selected_provider)
+            or read_credential_pool(selected_provider)
+        ):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 @method("setup.status")
 def _(rid, params: dict) -> dict:
     try:
-        from hermes_cli.main import _has_any_provider_configured
+        if not _transport_allows_profile_override():
+            configured = _public_provider_configuration_present()
+        else:
+            from hermes_cli.main import _has_any_provider_configured
 
-        return _ok(rid, {"provider_configured": bool(_has_any_provider_configured())})
+            configured = bool(_has_any_provider_configured())
+        return _ok(rid, {"provider_configured": configured})
     except Exception as e:
         return _err(rid, 5016, str(e))
 
@@ -11358,9 +12438,27 @@ def _(rid, params: dict) -> dict:
     surface onboarding before the user submits a doomed prompt.
     """
     try:
+        if not _transport_allows_profile_override():
+            # Runtime resolution may auto-detect a model by calling a configured
+            # custom endpoint. Public readiness polling is deliberately local:
+            # report only whether provider state exists and let session creation
+            # perform the actual runtime resolution for a real chat.
+            configured = _public_provider_configuration_present()
+            return _ok(
+                rid,
+                {
+                    "ok": configured,
+                    **(
+                        {}
+                        if configured
+                        else {"error": "No Hermes provider is configured."}
+                    ),
+                },
+            )
+
+        from hermes_cli.main import _has_any_provider_configured
         from hermes_cli.runtime_provider import resolve_runtime_provider
         from hermes_cli.auth import has_usable_secret
-        from hermes_cli.main import _has_any_provider_configured
 
         requested = str(params.get("provider") or "").strip() or None
         runtime = resolve_runtime_provider(requested=requested)
@@ -11635,6 +12733,39 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
 
 _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
 
+# Fixed Desktop command surface for non-operator transports. These names map
+# only to explicit owned-session RPCs or the built-in branches in
+# command.dispatch. They never enter configured quick commands, aliases,
+# plugins, skills, the CLI/shell, or the slash-worker subprocess.
+_PUBLIC_DESKTOP_COMMANDS: frozenset[str] = frozenset(
+    {
+        "agents",
+        "background",
+        "compress",
+        "goal",
+        "model",
+        "personality",
+        "queue",
+        "retry",
+        "save",
+        "status",
+        "steer",
+        "title",
+        "undo",
+        "usage",
+        "version",
+    }
+)
+_PUBLIC_DESKTOP_COMMAND_ALIASES: dict[str, str] = {
+    "bg": "background",
+    "btw": "background",
+    "compact": "compress",
+    "q": "queue",
+    "tasks": "agents",
+    "v": "version",
+}
+_FIXED_BUILTIN_DISPATCH_TOKEN = object()
+
 
 @method("commands.catalog")
 def _(rid, params: dict) -> dict:
@@ -11678,43 +12809,53 @@ def _(rid, params: dict) -> dict:
             cat_map[cat].append([name, desc])
 
         warning = ""
-        try:
-            qcmds = _load_cfg().get("quick_commands", {}) or {}
-            if isinstance(qcmds, dict) and qcmds:
-                bucket = "User commands"
-                if bucket not in cat_map:
-                    cat_map[bucket] = []
-                    cat_order.append(bucket)
-                for qname, qc in sorted(qcmds.items()):
-                    if not isinstance(qc, dict):
-                        continue
-                    key = f"/{qname}"
-                    canon[key.lower()] = key
-                    qtype = qc.get("type", "")
-                    if qtype == "exec":
-                        default_desc = f"exec: {qc.get('command', '')}"
-                    elif qtype == "alias":
-                        default_desc = f"alias → {qc.get('target', '')}"
-                    else:
-                        default_desc = qtype or "quick command"
-                    qdesc = str(qc.get("description") or default_desc)
-                    qdesc = qdesc[:120] + ("…" if len(qdesc) > 120 else "")
-                    all_pairs.append([key, qdesc])
-                    cat_map[bucket].append([key, qdesc])
-        except Exception as e:
-            if not warning:
-                warning = f"quick_commands discovery unavailable: {e}"
+        # Quick commands are configured shell snippets and aliases.  Public
+        # tickets still need the built-in catalogue for the Desktop palette,
+        # but must not learn quick-command names, descriptions, commands, or
+        # alias targets.  Operator/stdio transports retain the full catalogue.
+        if _transport_allows_profile_override():
+            try:
+                qcmds = _load_cfg().get("quick_commands", {}) or {}
+                if isinstance(qcmds, dict) and qcmds:
+                    bucket = "User commands"
+                    if bucket not in cat_map:
+                        cat_map[bucket] = []
+                        cat_order.append(bucket)
+                    for qname, qc in sorted(qcmds.items()):
+                        if not isinstance(qc, dict):
+                            continue
+                        key = f"/{qname}"
+                        canon[key.lower()] = key
+                        qtype = qc.get("type", "")
+                        if qtype == "exec":
+                            default_desc = f"exec: {qc.get('command', '')}"
+                        elif qtype == "alias":
+                            default_desc = f"alias → {qc.get('target', '')}"
+                        else:
+                            default_desc = qtype or "quick command"
+                        qdesc = str(qc.get("description") or default_desc)
+                        qdesc = qdesc[:120] + ("…" if len(qdesc) > 120 else "")
+                        all_pairs.append([key, qdesc])
+                        cat_map[bucket].append([key, qdesc])
+            except Exception as e:
+                if not warning:
+                    warning = f"quick_commands discovery unavailable: {e}"
 
         skill_count = 0
-        try:
-            from agent.skill_commands import scan_skill_commands
+        # Installed skills are profile-local user data (including arbitrary
+        # names, descriptions, and paths). Public Desktop tickets receive only
+        # the static built-in command registry; operator transports retain the
+        # full installed-skill catalogue.
+        if _transport_allows_profile_override():
+            try:
+                from agent.skill_commands import scan_skill_commands
 
-            for k, info in sorted(scan_skill_commands().items()):
-                d = str(info.get("description", "Skill"))
-                all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
-                skill_count += 1
-        except Exception as e:
-            warning = f"skill discovery unavailable: {e}"
+                for k, info in sorted(scan_skill_commands().items()):
+                    d = str(info.get("description", "Skill"))
+                    all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
+                    skill_count += 1
+            except Exception as e:
+                warning = f"skill discovery unavailable: {e}"
 
         for cat in cat_order:
             categories.append({"name": cat, "pairs": cat_map[cat]})
@@ -11813,14 +12954,10 @@ def _resolve_name(name: str) -> str:
         return name
 
 
-@method("command.dispatch")
-def _(rid, params: dict) -> dict:
-    name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
-    resolved = _resolve_name(name)
-    if resolved != name:
-        name = resolved
-    session = _sessions.get(params.get("session_id", ""))
-
+def _dispatch_dynamic_command(
+    rid: Any, name: str, arg: str, session: dict | None
+) -> dict | None:
+    """Resolve operator-configured commands, or return None for built-ins."""
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
         qc = qcmds[name]
@@ -11893,6 +13030,27 @@ def _(rid, params: dict) -> dict:
                 )
     except Exception:
         pass
+
+    return None
+
+
+@method("command.dispatch")
+def _(rid, params: dict) -> dict:
+    name = str(params.get("name") or "").lstrip("/").lower()
+    arg = str(params.get("arg") or "")
+    fixed_builtin = (
+        params.get("_fixed_builtin_dispatch") is _FIXED_BUILTIN_DISPATCH_TOKEN
+    )
+    if not fixed_builtin:
+        resolved = _resolve_name(name)
+        if resolved != name:
+            name = resolved
+    session = _sessions.get(params.get("session_id", ""))
+
+    if not fixed_builtin:
+        dynamic = _dispatch_dynamic_command(rid, name, arg, session)
+        if dynamic is not None:
+            return dynamic
 
     # ── Commands that queue messages onto _pending_input in the CLI ───
     # In the TUI the slash worker subprocess has no reader for that queue,
@@ -12111,9 +13269,6 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid, 4009, "session busy — /interrupt the current turn before /undo"
             )
-        db = _get_db()
-        if db is None:
-            return _db_unavailable_error(rid, code=5008)
         session_key = session.get("session_key", "")
         if not session_key:
             return _err(rid, 4001, "no session key for undo")
@@ -12127,28 +13282,31 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4004, f"undo: invalid count {arg_str!r} — use /undo or /undo N")
         if n < 1:
             n = 1
-        try:
-            recents = db.list_recent_user_messages(session_key, limit=max(n, 10))
-        except Exception as e:
-            return _err(rid, 5008, f"undo: failed to load history: {e}")
-        if not recents:
-            return _err(rid, 4018, "no user messages to undo")
-        # recents[0] is the most-recent user turn; pick the Nth-from-last.
-        # If N exceeds the number of user turns, back up to the oldest.
-        target_idx = min(n - 1, len(recents) - 1)
-        target_id = recents[target_idx]["id"]
-        try:
-            result = db.rewind_to_message(session_key, target_id)
-        except ValueError as e:
-            return _err(rid, 4004, f"undo: {e}")
-        except Exception as e:
-            return _err(rid, 5008, f"undo: {e}")
-        # Reload the active-only transcript into the in-memory session
-        # history so subsequent turns see the truncated view.
-        try:
-            active = db.get_messages_as_conversation(session_key)
-        except Exception:
-            active = []
+        with _session_db(session) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5008)
+            try:
+                recents = db.list_recent_user_messages(session_key, limit=max(n, 10))
+            except Exception as e:
+                return _err(rid, 5008, f"undo: failed to load history: {e}")
+            if not recents:
+                return _err(rid, 4018, "no user messages to undo")
+            # recents[0] is the most-recent user turn; pick the Nth-from-last.
+            # If N exceeds the number of user turns, back up to the oldest.
+            target_idx = min(n - 1, len(recents) - 1)
+            target_id = recents[target_idx]["id"]
+            try:
+                result = db.rewind_to_message(session_key, target_id)
+            except ValueError as e:
+                return _err(rid, 4004, f"undo: {e}")
+            except Exception as e:
+                return _err(rid, 5008, f"undo: {e}")
+            # Reload the active-only transcript into the in-memory session
+            # history so subsequent turns see the truncated view.
+            try:
+                active = db.get_messages_as_conversation(session_key)
+            except Exception:
+                active = []
         with session["history_lock"]:
             session["history"] = list(active)
             session["history_version"] = int(session.get("history_version", 0)) + 1
@@ -12282,6 +13440,156 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5009, f"compress failed: {exc}")
 
     return _err(rid, 4018, f"not a quick/plugin/skill command: {name}")
+
+
+def _desktop_command_result(response: dict) -> dict | None:
+    """Return an RPC result payload, preserving an error envelope as None."""
+    result = response.get("result")
+    return result if isinstance(result, dict) else None
+
+
+@method("desktop.command")
+def _(rid, params: dict) -> dict:
+    """Run one fixed, Desktop-supported built-in against an owned session."""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+
+    raw = str(params.get("command") or "").strip().lstrip("/")
+    parts = raw.split(maxsplit=1)
+    name = parts[0].lower() if parts else ""
+    arg = parts[1] if len(parts) > 1 else ""
+    name = _PUBLIC_DESKTOP_COMMAND_ALIASES.get(name, name)
+    if name not in _PUBLIC_DESKTOP_COMMANDS:
+        if not _transport_allows_profile_override():
+            # This is a terminal public-policy denial, not the compatibility
+            # signal that lets trusted operator clients retry through the
+            # legacy slash/command dispatchers.
+            return _err(
+                rid,
+                4033,
+                f"public desktop command is not authorized: {name or '(empty)'}",
+            )
+        return _err(rid, 4018, f"desktop command is not allowed: {name or '(empty)'}")
+
+    sid = str(params.get("session_id") or "")
+
+    # These branches already implement the desired structured send/prefill
+    # contract. The private object token skips every dynamic resolver before
+    # entering their built-in code.
+    if name in {"compress", "goal", "queue", "retry", "steer", "undo"}:
+        return _methods["command.dispatch"](
+            rid,
+            {
+                "_fixed_builtin_dispatch": _FIXED_BUILTIN_DISPATCH_TOKEN,
+                "arg": arg,
+                "name": name,
+                "session_id": sid,
+            },
+        )
+
+    if name == "agents":
+        response = _methods["session.active_list"](
+            rid, {"current_session_id": sid, "session_id": sid}
+        )
+        if "error" in response:
+            return response
+        rows = (_desktop_command_result(response) or {}).get("sessions") or []
+        lines = ["Active desktop sessions:"]
+        for row in rows:
+            label = str(row.get("title") or row.get("session_key") or row.get("id") or "")
+            status = str(row.get("status") or "idle")
+            model = str(row.get("model") or "")
+            lines.append(f"- {label} — {status}{f' · {model}' if model else ''}")
+        if len(lines) == 1:
+            lines.append("- none")
+        return _ok(rid, {"output": "\n".join(lines)})
+
+    if name == "background":
+        if not arg.strip():
+            return _err(rid, 4004, "usage: /background <prompt>")
+        response = _methods["prompt.background"](
+            rid, {"session_id": sid, "text": arg}
+        )
+        if "error" in response:
+            return response
+        task_id = str((_desktop_command_result(response) or {}).get("task_id") or "")
+        return _ok(rid, {"output": f"Background task started: {task_id}"})
+
+    if name == "model":
+        if not arg.strip():
+            return _err(rid, 4004, "use the Desktop model picker")
+        config_params = {
+            "key": "model",
+            "session_id": sid,
+            "value": arg,
+        }
+        if policy_error := _public_config_set_error(config_params, rid):
+            return policy_error
+        response = _methods["config.set"](rid, config_params)
+        if "error" in response:
+            return response
+        result = _desktop_command_result(response) or {}
+        payload = {"output": f"Model: {result.get('value') or arg}"}
+        if result.get("warning"):
+            payload["warning"] = str(result["warning"])
+        return _ok(rid, payload)
+
+    if name == "personality":
+        if not arg.strip():
+            return _err(rid, 4004, "usage: /personality <name|none>")
+        try:
+            personality, new_prompt = _validate_personality(arg, _load_cfg())
+        except Exception:
+            # Do not turn invalid-name guesses into configured-personality
+            # enumeration on the public Desktop surface.
+            return _err(rid, 4004, "unknown personality")
+        _apply_personality_to_session(sid, session, new_prompt, personality)
+        return _ok(rid, {"output": f"Personality: {personality or 'none'}"})
+
+    if name == "save":
+        response = _methods["session.save"](rid, {"session_id": sid})
+        if "error" in response:
+            return response
+        filename = str((_desktop_command_result(response) or {}).get("file") or "")
+        return _ok(rid, {"output": f"Conversation saved: {filename}"})
+
+    if name == "status":
+        return _methods["session.status"](rid, {"session_id": sid})
+
+    if name == "title":
+        response = _methods["session.title"](rid, {"session_id": sid})
+        if "error" in response:
+            return response
+        result = _desktop_command_result(response) or {}
+        title = str(result.get("title") or "").strip()
+        key = str(result.get("session_key") or "").strip()
+        lines = [f"Session ID: {key}"] if key else []
+        lines.append(f"Title: {title}" if title else "No title set.")
+        return _ok(rid, {"output": "\n".join(lines)})
+
+    if name == "usage":
+        response = _methods["session.usage"](rid, {"session_id": sid})
+        if "error" in response:
+            return response
+        usage = _desktop_command_result(response) or {}
+        lines = [
+            f"Calls: {int(usage.get('calls') or 0):,}",
+            f"Input tokens: {int(usage.get('input') or 0):,}",
+            f"Output tokens: {int(usage.get('output') or 0):,}",
+            f"Total tokens: {int(usage.get('total') or 0):,}",
+        ]
+        lines.extend(str(line) for line in usage.get("credits_lines") or [])
+        return _ok(rid, {"output": "\n".join(lines)})
+
+    if name == "version":
+        from hermes_cli import __release_date__, __version__
+
+        return _ok(rid, {"output": f"Hermes Agent v{__version__} ({__release_date__})"})
+
+    # Exhaustiveness guard: adding a name to the fixed table without a branch
+    # must fail closed rather than falling into a broader dispatcher.
+    return _err(rid, 4018, f"desktop command is not implemented: {name}")
 
 
 # ── Methods: paste ────────────────────────────────────────────────────
@@ -12501,7 +13809,27 @@ def _(rid, params: dict) -> dict:
 
     items: list[dict] = []
     try:
-        root = _completion_cwd(params)
+        public_root: Path | None = None
+        if not _transport_allows_profile_override():
+            session, err = _sess_nowait(params, rid)
+            if err:
+                return err
+            trusted_cwd = str(session.get("cwd") or "").strip()
+            if not trusted_cwd:
+                return _err(
+                    rid,
+                    4033,
+                    "owned live session has no server-recorded completion cwd",
+                )
+            # Public params.cwd/profile are display hints, never filesystem
+            # authority. Completion stays rooted at the server-owned session,
+            # with no process-cwd fallback when that recorded path is stale.
+            public_root = Path(trusted_cwd).expanduser().resolve(strict=False)
+            if not public_root.is_dir():
+                return _err(rid, 4002, "session working directory does not exist")
+            root = str(public_root)
+        else:
+            root = _completion_cwd(params)
         is_context = word.startswith("@")
         query = word[1:] if is_context else word
 
@@ -12576,6 +13904,21 @@ def _(rid, params: dict) -> dict:
         search_dir = (
             search_dir if os.path.isabs(search_dir) else os.path.join(root, search_dir)
         )
+        if public_root is not None:
+            # Resolve before any caller-directed directory metadata/listing.
+            # ``Path.resolve`` follows an in-workspace symlink, so a link to an
+            # outside directory fails the same containment proof as /etc, ~,
+            # or ../.. instead of becoming an alternate filesystem root.
+            resolved_search_dir = Path(search_dir).resolve(strict=False)
+            try:
+                resolved_search_dir.relative_to(public_root)
+            except ValueError:
+                return _err(
+                    rid,
+                    4033,
+                    "public path completion is confined to the owned session workspace",
+                )
+            search_dir = str(resolved_search_dir)
         if not os.path.isdir(search_dir):
             return _ok(rid, {"items": []})
 
@@ -12589,7 +13932,17 @@ def _(rid, params: dict) -> dict:
             if is_context and not prefix_tag and entry.startswith("."):
                 continue
             full = os.path.join(search_dir, entry)
-            is_dir = os.path.isdir(full)
+            if public_root is not None:
+                # Do not follow an entry symlink outside the workspace merely
+                # to decide whether the completion should have a slash suffix.
+                resolved_full = Path(full).resolve(strict=False)
+                try:
+                    resolved_full.relative_to(public_root)
+                except ValueError:
+                    continue
+                is_dir = resolved_full.is_dir()
+            else:
+                is_dir = os.path.isdir(full)
             # Explicit `@folder:` / `@file:` — honour the user's filter.  Skip
             # the opposite kind instead of auto-rewriting the completion tag,
             # which used to defeat the prefix and let `@folder:` list files.
@@ -12727,12 +14080,21 @@ def _(rid, params: dict) -> dict:
         from prompt_toolkit.document import Document
         from prompt_toolkit.formatted_text import to_plain_text
 
-        from agent.skill_commands import get_skill_commands
-        from agent.skill_bundles import get_skill_bundles
+        if _transport_allows_profile_override():
+            from agent.skill_commands import get_skill_commands
+            from agent.skill_bundles import get_skill_bundles
+
+            skill_commands_provider = get_skill_commands
+            skill_bundles_provider = get_skill_bundles
+        else:
+            # Profile-local skills and bundles are both metadata and executable
+            # extensions. A public completion request gets built-ins only.
+            skill_commands_provider = dict
+            skill_bundles_provider = dict
 
         completer = SlashCommandCompleter(
-            skill_commands_provider=lambda: get_skill_commands(),
-            skill_bundles_provider=lambda: get_skill_bundles(),
+            skill_commands_provider=skill_commands_provider,
+            skill_bundles_provider=skill_bundles_provider,
         )
         doc = Document(text, len(text))
         items = [
@@ -12795,6 +14157,48 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5020, str(e))
 
 
+def _public_model_options_projection(payload: dict) -> dict:
+    """Return the fixed public model-picker schema.
+
+    Provider inventory rows can contain configured endpoint URLs, credential
+    hints/state, sources, warnings, and future provider-specific fields. Build
+    a positive projection instead of chasing sensitive keys with a blacklist.
+    """
+    providers: list[dict] = []
+    for raw in payload.get("providers") or []:
+        if not isinstance(raw, dict):
+            continue
+        models = [str(model) for model in raw.get("models") or [] if str(model)]
+        row = {
+            "slug": str(raw.get("slug") or ""),
+            "name": str(raw.get("name") or raw.get("slug") or ""),
+            "is_current": bool(raw.get("is_current")),
+            "is_user_defined": bool(raw.get("is_user_defined")),
+            "models": models,
+            "total_models": int(raw.get("total_models") or len(models)),
+        }
+        raw_caps = raw.get("capabilities")
+        if isinstance(raw_caps, dict):
+            capabilities: dict[str, dict[str, bool]] = {}
+            for model in models:
+                caps = raw_caps.get(model)
+                if not isinstance(caps, dict):
+                    continue
+                capabilities[model] = {
+                    "fast": bool(caps.get("fast")),
+                    "reasoning": bool(caps.get("reasoning", True)),
+                }
+            if capabilities:
+                row["capabilities"] = capabilities
+        providers.append(row)
+
+    return {
+        "providers": providers,
+        "model": str(payload.get("model") or ""),
+        "provider": str(payload.get("provider") or ""),
+    }
+
+
 @method("model.options")
 def _(rid, params: dict) -> dict:
     try:
@@ -12821,19 +14225,38 @@ def _(rid, params: dict) -> dict:
         # Curated model lists are preserved — list_authenticated_providers
         # populates `models` from the curated catalog, not provider_model_ids
         # (which would pull non-agentic models like TTS/embeddings/etc.).
+        public_request = not _transport_allows_profile_override()
+        if public_request and bool(params.get("refresh")):
+            # Central authorization rejects this too; keep direct/internal
+            # handler calls fail-closed instead of relying on call topology.
+            return _err(
+                rid,
+                4033,
+                "public model.options does not permit provider refresh or probing",
+            )
+
         payload = build_models_payload(
             ctx,
             explicit_only=bool(params.get("explicit_only")),
             include_unconfigured=bool(params.get("include_unconfigured")),
             picker_hints=True,
             canonical_order=True,
-            pricing=True,
+            # Pricing adds a credentialed Nous tier check. Public model reads
+            # stay local and expose no credential/account-adjacent projection.
+            pricing=not public_request,
             capabilities=True,
-            refresh=bool(params.get("refresh")),
-            probe_custom_providers=bool(params.get("refresh")),
-            probe_current_custom_provider=not bool(params.get("refresh")),
+            refresh=bool(params.get("refresh")) if not public_request else False,
+            probe_custom_providers=(
+                bool(params.get("refresh")) if not public_request else False
+            ),
+            probe_current_custom_provider=(
+                not bool(params.get("refresh")) if not public_request else False
+            ),
         )
-        return _ok(rid, payload)
+        return _ok(
+            rid,
+            _public_model_options_projection(payload) if public_request else payload,
+        )
     except Exception as e:
         return _err(rid, 5033, str(e))
 
@@ -13426,7 +14849,11 @@ def _(rid, params: dict) -> dict:
         cutoff = time.time() - days * 86400
         rows = [
             s
-            for s in db.list_sessions_rich(limit=500, compact_rows=True)
+            for s in db.list_sessions_rich(
+                limit=500,
+                compact_rows=True,
+                **_stored_owner_kwargs(),
+            )
             if (s.get("started_at") or 0) >= cutoff
         ]
         return _ok(
@@ -13933,6 +15360,32 @@ def _(rid, params: dict) -> dict:
     if not targets:
         return _err(rid, 4018, "names required")
 
+    session_id = str(params.get("session_id", "") or "")
+    session = _sessions.get(session_id)
+    if not _transport_allows_profile_override():
+        # Public WebSocket tickets identify a user, not a profile/config scope.
+        # Only a server-owned live session proves which profile may be changed;
+        # omitted/invented/finalized ids must never fall through to launch config.
+        if session is None or session.get("_finalized"):
+            return _err(
+                rid,
+                4033,
+                "a valid owned live session is required to configure tools",
+            )
+        if error := _session_principal_error(session, rid):
+            return error
+    try:
+        profile_home = (
+            _validated_session_profile_home(session) if session is not None else None
+        )
+        home_token = (
+            set_hermes_home_override(profile_home)
+            if profile_home is not None
+            else None
+        )
+    except Exception as e:
+        return _err(rid, 5035, str(e))
+
     try:
         from hermes_cli.config import load_config, save_config
         from hermes_cli.tools_config import (
@@ -13960,9 +15413,8 @@ def _(rid, params: dict) -> dict:
         )
         save_config(cfg)
 
-        session = _sessions.get(params.get("session_id", ""))
         info = (
-            _reset_session_agent(params.get("session_id", ""), session)
+            _reset_session_agent(session_id, session)
             if session
             else None
         )
@@ -13989,6 +15441,9 @@ def _(rid, params: dict) -> dict:
         )
     except Exception as e:
         return _err(rid, 5035, str(e))
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 @method("toolsets.list")

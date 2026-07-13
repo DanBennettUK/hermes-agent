@@ -12,6 +12,7 @@ import {
   isDesktopSlashCommand,
   resolveDesktopCommand
 } from '@/lib/desktop-slash-commands'
+import { shouldUseLegacyDesktopCommandFallback } from '@/lib/gateway-rpc'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { type ComposerAttachment, setComposerDraft } from '@/store/composer'
@@ -109,9 +110,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         return { render, sessionId }
       }
 
-      // `exec` commands (and unknown skill / quick commands the backend owns)
-      // run on the gateway and render their text output inline. This is the only
-      // path that talks to slash.exec / command.dispatch.
+      // Fixed built-ins run through desktop.command, whose server-side table is
+      // safe for owned public sessions. The legacy slash.exec / command.dispatch
+      // chain remains only as an operator/older-backend compatibility fallback.
       async function runExec(ctx: SlashActionCtx): Promise<void> {
         const { arg, command, name } = ctx
         const resolved = await withSlashOutput(ctx)
@@ -184,12 +185,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           await submitPromptText(message)
         }
 
-        try {
-          const result = await requestGateway<unknown>('slash.exec', {
-            session_id: sessionId,
-            command: command.replace(/^\/+/, '')
-          })
-
+        const consumeResult = async (result: unknown): Promise<void> => {
           const dispatch = parseCommandDispatch(result)
 
           if (dispatch) {
@@ -201,10 +197,42 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           const output = result && typeof result === 'object' ? (result as SlashExecResponse) : null
           const body = output?.output || `/${name}: no output`
           renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)
+        }
+
+        try {
+          const result = await requestGateway<unknown>('desktop.command', {
+            session_id: sessionId,
+            command: command.replace(/^\/+/, '')
+          })
+
+          await consumeResult(result)
+
+          return
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+
+          if (!shouldUseLegacyDesktopCommandFallback(err, $connection.get())) {
+            renderSlashOutput(`error: ${message}`)
+
+            return
+          }
+
+          // Older trusted operator backends may not implement desktop.command.
+          // Public OAuth connections stop above: they must never enter these
+          // legacy dynamic dispatchers, even when the fixed RPC is missing.
+        }
+
+        try {
+          const result = await requestGateway<unknown>('slash.exec', {
+            session_id: sessionId,
+            command: command.replace(/^\/+/, '')
+          })
+
+          await consumeResult(result)
 
           return
         } catch {
-          // Fall back to command.dispatch for skill/send/alias directives.
+          // Fall back to command.dispatch for operator skill/send/alias directives.
         }
 
         try {

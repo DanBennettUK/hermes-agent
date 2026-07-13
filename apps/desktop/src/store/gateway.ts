@@ -1,8 +1,9 @@
 import { type ConnectionState, type GatewayEvent, resolveGatewayWsUrl } from '@hermes/shared'
 import { atom } from 'nanostores'
 
+import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
-import { setGatewayState } from '@/store/session'
+import { setConnection, setGatewayState } from '@/store/session'
 
 // ── Multi-profile gateway routing ──────────────────────────────────────────
 // Concurrent sessions across profiles need concurrent sockets: the renderer's
@@ -102,17 +103,50 @@ function clearTimer(entry: Secondary): void {
   }
 }
 
-async function openSecondary(entry: Secondary): Promise<void> {
+function isCurrentSecondary(entry: Secondary): boolean {
+  return entry.wantOpen && secondaries.get(entry.profile) === entry
+}
+
+function closeStaleSecondary(entry: Secondary): null {
+  entry.gateway.close()
+
+  return null
+}
+
+async function openSecondary(entry: Secondary): Promise<HermesConnection | null> {
   const desktop = window.hermesDesktop
 
   if (!desktop) {
-    return
+    return null
+  }
+
+  if (!isCurrentSecondary(entry)) {
+    return closeStaleSecondary(entry)
   }
 
   const conn = await desktop.getConnection(entry.profile)
+
+  if (!isCurrentSecondary(entry)) {
+    return closeStaleSecondary(entry)
+  }
+
   const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+
+  // getConnection/getGatewayWsUrl may both outlive a prune or replacement.
+  // Only the exact entry still registered for this profile may open a socket.
+  if (!isCurrentSecondary(entry)) {
+    return closeStaleSecondary(entry)
+  }
+
   await entry.gateway.connect(wsUrl)
+
+  if (!isCurrentSecondary(entry)) {
+    return closeStaleSecondary(entry)
+  }
+
   void desktop.touchBackend?.(entry.profile).catch(() => undefined)
+
+  return conn
 }
 
 function scheduleReconnect(entry: Secondary): void {
@@ -137,8 +171,14 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
   entry.reconnecting = true
 
   try {
-    await openSecondary(entry)
+    const connection = await openSecondary(entry)
     entry.reconnectAttempt = 0
+
+    // The profile may have changed while getConnection/connect were pending.
+    // Publish only if this exact entry still owns the active gateway route.
+    if (connection && isCurrentSecondary(entry) && activeKey === entry.profile && activeGateway() === entry.gateway) {
+      setConnection(connection)
+    }
   } catch {
     // Transport failure → fall through to the backoff below.
   } finally {
