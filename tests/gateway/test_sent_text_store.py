@@ -9,6 +9,9 @@ out-of-session replies — issue #1594 residual gap, issue #75131).
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
+import stat
 
 import pytest
 
@@ -32,6 +35,11 @@ def store(tmp_path, monkeypatch):
 def test_record_and_lookup_roundtrip(store):
     sent_text_store.record("+1555", "m-1", "Good morning.")
     assert sent_text_store.lookup("+1555", "m-1") == "Good morning."
+
+
+def _record_in_child(home: str, index: int) -> None:
+    os.environ["HERMES_HOME"] = home
+    sent_text_store.record("chat", f"child-{index}", f"text {index}")
 
 
 def test_lookup_missing_returns_none(store):
@@ -71,6 +79,38 @@ def test_noop_on_empty_inputs(store):
     sent_text_store.record("c", "m", None)
     assert sent_text_store.lookup("", "m") is None
     assert sent_text_store.lookup("c", "") is None
+
+
+def test_concurrent_process_writers_retain_all_entries(store):
+    processes = [
+        multiprocessing.Process(target=_record_in_child, args=(str(store), index))
+        for index in range(12)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    for index in range(12):
+        assert sent_text_store.lookup("chat", f"child-{index}") == f"text {index}"
+
+
+@pytest.mark.linux_only
+def test_store_and_lock_are_owner_only(store):
+    sent_text_store.record("chat", "m-1", "private text")
+    state = store / "state"
+    assert stat.S_IMODE((state / "sent_text_index.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((state / "sent_text_index.json.lock").stat().st_mode) == 0o600
+
+
+def test_lookup_uses_cache_until_file_changes(store, monkeypatch):
+    sent_text_store.record("chat", "m-1", "cached text")
+
+    def unexpected_read(path):
+        raise AssertionError(f"unexpected disk read: {path}")
+
+    monkeypatch.setattr(sent_text_store, "_read", unexpected_read)
+    assert sent_text_store.lookup("chat", "m-1") == "cached text"
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +155,11 @@ def _tapback_event(target_id: str, target_text=None) -> dict:
     return {
         "messageId": "react-evt-1",
         "platform": "iMessage",
-        "space": {"id": "+155****4567", "type": "dm", "phone": "+155****4567"},
+        "space": {
+            "id": "any;-;+15555554567",
+            "type": "dm",
+            "phone": "+15555554567",
+        },
         "sender": {"id": "+155****4567"},
         "content": {
             "type": "reaction",
@@ -134,7 +178,11 @@ def _top_level_reply_event(target_id: str, target_text=None) -> dict:
     return {
         "messageId": "inbound-evt-1",
         "platform": "iMessage",
-        "space": {"id": "+155****4567", "type": "dm", "phone": "+155****4567"},
+        "space": {
+            "id": "any;-;+15555554567",
+            "type": "dm",
+            "phone": "+15555554567",
+        },
         "sender": {"id": "+155****4567"},
         "content": {"type": "text", "text": "short reply"},
         "replyToMessageId": target_id,
@@ -179,7 +227,7 @@ async def test_tapback_hydrates_text_from_outbound_index(
     captured = _capture(adapter, monkeypatch)
 
     sent_text_store.record(
-        "+155****4567",
+        "+15555554567",
         "spc-msg-cron-origin",
         "Morning reminder: the library visit moved to 3pm.",
     )
@@ -221,7 +269,7 @@ async def test_top_level_reply_hydrates_empty_quoted_text(
     captured = _capture(adapter, monkeypatch)
 
     sent_text_store.record(
-        "+155****4567",
+        "+15555554567",
         "spc-msg-00000000-0000-0000-0000-000000000000",
         "Scheduled message for the morning. Take a moment to reset and enjoy the day.",
     )

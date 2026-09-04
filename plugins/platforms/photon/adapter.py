@@ -2234,8 +2234,9 @@ class PhotonAdapter(BasePlatformAdapter):
             for old in list(sent.keys())[: len(sent) - self._SENT_IDS_MAX]:
                 del sent[old]
 
-    @staticmethod
+    @classmethod
     def _hydrated_reply_text(
+        cls,
         chat_id: Optional[str],
         reply_to_message_id: Optional[str],
         reply_to_text: Optional[str],
@@ -2262,7 +2263,7 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             from gateway.sent_text_store import lookup as _sent_lookup
 
-            return _sent_lookup(chat_id, reply_to_message_id)
+            return _sent_lookup(cls._normalize_chat_key(chat_id), reply_to_message_id)
         except Exception:
             # The index must never break inbound dispatch.
             return None
@@ -2277,7 +2278,7 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             from gateway.sent_text_store import record as _sent_record
 
-            _sent_record(chat_id, message_id, sent_text)
+            _sent_record(self._normalize_chat_key(chat_id), message_id, sent_text)
         except Exception:
             pass
 
@@ -2946,7 +2947,11 @@ async def _standalone_send(
                     # for — #75131/#1594).
                     from gateway.sent_text_store import record as _sent_record
 
-                    _sent_record(chat_id, last_message_id, message)
+                    _sent_record(
+                        PhotonAdapter._normalize_chat_key(chat_id),
+                        last_message_id,
+                        message,
+                    )
 
             # 2. Each attachment as a separate /send-attachment call.
             #    media_files is List[Tuple[path, is_voice]] (see
