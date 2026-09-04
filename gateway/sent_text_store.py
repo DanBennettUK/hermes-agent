@@ -1,4 +1,5 @@
 """Bounded local index of recently-sent outbound message text."""
+
 from __future__ import annotations
 
 import json
@@ -17,6 +18,7 @@ _CACHE = {}
 
 def _store_path() -> str:
     from hermes_constants import get_hermes_home
+
     return os.path.join(str(get_hermes_home()), "state", "sent_text_index.json")
 
 
@@ -53,6 +55,7 @@ def _exclusive_file_lock(path: str) -> Iterator[None]:
             pass
         if os.name == "nt":  # pragma: no cover - exercised on Windows CI
             import msvcrt
+
             if os.fstat(fd).st_size == 0:
                 os.write(fd, b"0")
             os.lseek(fd, 0, os.SEEK_SET)
@@ -64,6 +67,7 @@ def _exclusive_file_lock(path: str) -> Iterator[None]:
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
+
             fcntl.flock(fd, fcntl.LOCK_EX)
             try:
                 yield
@@ -118,9 +122,9 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
                 "ts": int(time.time()),
             }
             if len(data) > _MAX_ENTRIES:
-                oldest = sorted(
-                    data.items(), key=lambda item: item[1].get("ts", 0)
-                )[: len(data) - _MAX_ENTRIES]
+                oldest = sorted(data.items(), key=lambda item: item[1].get("ts", 0))[
+                    : len(data) - _MAX_ENTRIES
+                ]
                 for key, _ in oldest:
                     data.pop(key, None)
             _write(path, data)
