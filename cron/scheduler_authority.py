@@ -1,8 +1,21 @@
 """Transport-only cron execution; output/delivery remain with the firing scheduler."""
 import asyncio
+import contextlib
 import hashlib
 import json
+import time
 import uuid
+from typing import Optional
+
+# How long the remote canonical firer keeps reconnecting to observe one admitted fire
+# after its transport drops. A draining owner defers stop() for up to 1800s so in-flight
+# turns are not amputated (#77184), yet its socket gate cuts non-waiting /api/ws clients
+# immediately (close 1013) the moment draining starts — a healthy turn then outlives its
+# observer's socket by as long as the drain itself. Budget matches that force-drain cap
+# plus margin; only a reconnect window that outlives it surfaces the drop as unknown.
+RECONNECT_BUDGET_SECONDS = 1860.0
+_RECONNECT_DELAY_MIN = 0.5
+_RECONNECT_DELAY_MAX = 5.0
 
 
 class CronExecutionUnknown(RuntimeError):
@@ -54,7 +67,7 @@ def _lift_pause(job_id, pause):
 
 def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
     from gateway.session_cron import owner_for_home, operation
-    from hermes_cli.gateway_client import connect_gateway
+    from hermes_cli.gateway_client import GatewayRPCError, connect_gateway
     from hermes_constants import get_hermes_home
     from utils import atomic_json_write
 
@@ -125,8 +138,74 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             delay = min(delay * 2, 2.0)
 
     async def remote():
-        async with connect_gateway() as client:
-            return await observe(lambda op, data: client.rpc('cron.' + op, **data))
+        # One owner connection shared by submit and the status poll, re-established with
+        # backoff when the transport drops mid-observation. The initial dial happens
+        # before any admission: a refused dial there is a definite non-admission and
+        # stays a bookable failure. ``submit`` is never resent here — observe's recover
+        # path classifies a lost submit answer, and replaying the submission blind could
+        # duplicate the fire. Idempotent observation verbs (status/cancel) are safe to
+        # re-issue against a reconnect: a replacement owner either reports the same
+        # admission or reports it unknown, which stays fail-closed.
+        client_cm = connect_gateway()
+        client = await client_cm.__aenter__()
+        reconnect_deadline = None
+        reconnect_delay = _RECONNECT_DELAY_MIN
+        last_transport_error: Optional[BaseException] = None
+
+        async def close_client():
+            nonlocal client_cm, client
+            cm, client_cm, client = client_cm, None, None
+            if cm is not None:
+                with contextlib.suppress(Exception):
+                    await cm.__aexit__(None, None, None)
+
+        async def call(op, data):
+            nonlocal client, client_cm, reconnect_deadline, reconnect_delay, last_transport_error
+            while True:
+                if client is None:
+                    # Reconnect path — only reachable after a successful first dial.
+                    while True:
+                        now = time.monotonic()
+                        if reconnect_deadline is None:
+                            reconnect_deadline = now + RECONNECT_BUDGET_SECONDS
+                        elif now >= reconnect_deadline:
+                            raise last_transport_error
+                        client_cm = connect_gateway()
+                        try:
+                            client = await client_cm.__aenter__()
+                        except Exception as connect_error:
+                            last_transport_error = connect_error
+                            with contextlib.suppress(Exception):
+                                await client_cm.__aexit__(None, None, None)
+                            client_cm = None
+                            if op == 'submit':
+                                raise
+                            await asyncio.sleep(reconnect_delay)
+                            reconnect_delay = min(reconnect_delay * 2, _RECONNECT_DELAY_MAX)
+                            continue
+                        break
+                try:
+                    return await client.rpc('cron.' + op, **data)
+                except GatewayRPCError:
+                    # A returned owner error is a definite verdict, never a transport drop.
+                    raise
+                except Exception as exc:
+                    await close_client()
+                    if op == 'submit':
+                        raise
+                    now = time.monotonic()
+                    if reconnect_deadline is None:
+                        reconnect_deadline = now + RECONNECT_BUDGET_SECONDS
+                    elif now >= reconnect_deadline:
+                        raise
+                    last_transport_error = exc
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, _RECONNECT_DELAY_MAX)
+
+        try:
+            return await observe(call)
+        finally:
+            await close_client()
 
     try:
         if owner is not None:
